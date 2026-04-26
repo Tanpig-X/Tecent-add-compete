@@ -18,7 +18,7 @@ from typing import List, Tuple
 
 import torch
 
-from utils import set_seed, EarlyStopping, create_logger
+from utils import set_seed, enable_fast_math, EarlyStopping, create_logger
 from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
@@ -80,16 +80,6 @@ def parse_args() -> argparse.Namespace:
                         help='Disable BF16 autocast')
     parser.add_argument('--deterministic', action='store_true', default=False,
                         help='Force cuDNN deterministic (slower but reproducible)')
-    parser.add_argument('--warmup_steps', type=int, default=0,
-                        help='Linear LR warmup over the first N optimizer steps '
-                             '(0 = no warmup, scheduler inactive unless '
-                             '--lr_decay_steps is also set)')
-    parser.add_argument('--lr_decay_steps', type=int, default=0,
-                        help='Cosine LR decay length (in steps) after warmup. '
-                             '0 = no decay; LR stays at base after warmup.')
-    parser.add_argument('--min_lr_factor', type=float, default=0.1,
-                        help='Floor LR as a fraction of base LR after the cosine '
-                             'decay completes (only used when lr_decay_steps>0).')
     parser.add_argument('--buffer_batches', type=int, default=20,
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
@@ -232,18 +222,10 @@ def main() -> None:
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
     Path(args.tf_events_dir).mkdir(parents=True, exist_ok=True)
 
-    # Initialize logger and RNG. Inlined here (instead of calling utils helpers)
-    # so the script works against the original utils.py too — Taiji deployments
-    # that bundle a stale utils.py won't break on missing symbols.
-    set_seed(args.seed)
-    if args.deterministic:
-        torch.backends.cudnn.deterministic = True
-    else:
-        torch.set_float32_matmul_precision('high')
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
+    # Initialize logger and RNG.
+    set_seed(args.seed, deterministic=args.deterministic)
+    if not args.deterministic:
+        enable_fast_math()
     create_logger(os.path.join(args.log_dir, 'train.log'))
     logging.info(f"Args: {vars(args)}")
 
@@ -397,9 +379,6 @@ def main() -> None:
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
         use_amp=args.use_amp,
-        warmup_steps=args.warmup_steps,
-        lr_decay_steps=args.lr_decay_steps,
-        min_lr_factor=args.min_lr_factor,
     )
 
     trainer.train()

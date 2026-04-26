@@ -1,6 +1,5 @@
 """PCVR Parquet dataset module (performance-tuned).
 
-
 Reads raw multi-column Parquet directly and obtains feature metadata from
 ``schema.json``.
 
@@ -174,13 +173,8 @@ class PCVRParquetDataset(IterableDataset):
         """
         super().__init__()
 
-        # Accept a directory, a single file path, or an explicit list of files.
-        if isinstance(parquet_path, (list, tuple)):
-            files = list(parquet_path)
-            if not files:
-                raise FileNotFoundError("Empty parquet_path list")
-            self._parquet_files = files
-        elif os.path.isdir(parquet_path):
+        # Accept either a directory or a single file path.
+        if os.path.isdir(parquet_path):
             import glob
             files = sorted(glob.glob(os.path.join(parquet_path, '*.parquet')))
             if not files:
@@ -448,35 +442,6 @@ class PCVRParquetDataset(IterableDataset):
         else:
             logging.info(msg)
 
-    @staticmethod
-    def _scatter_varlen(
-        offsets: "npt.NDArray[np.int64]",
-        values: "npt.NDArray[Any]",
-        max_len: int,
-        B: int,
-        out: "npt.NDArray[Any]",
-    ) -> "npt.NDArray[np.int64]":
-        """Vectorized per-row variable-length scatter.
-
-        Writes ``values[offsets[i] : offsets[i] + use_len]`` into
-        ``out[i, :use_len]`` for every row ``i``, where
-        ``use_len = min(offsets[i+1]-offsets[i], max_len)``.
-        Replaces a per-row Python ``for`` loop and is roughly an order
-        of magnitude faster on typical batch sizes.
-
-        Returns the per-row use_lens vector (shape ``[B]``).
-        """
-        raw_lens = (offsets[1:B + 1] - offsets[:B]).astype(np.int64, copy=False)
-        use_lens = np.minimum(raw_lens, max_len)
-        total = int(use_lens.sum())
-        if total > 0:
-            row_ids = np.repeat(np.arange(B, dtype=np.int64), use_lens)
-            row_starts = np.cumsum(use_lens) - use_lens
-            within_row = np.arange(total, dtype=np.int64) - np.repeat(row_starts, use_lens)
-            src_ids = np.repeat(offsets[:B].astype(np.int64, copy=False), use_lens) + within_row
-            out[row_ids, within_row] = values[src_ids]
-        return use_lens
-
     def _pad_varlen_int_column(
         self,
         arrow_col: "pa.ListArray",
@@ -487,13 +452,28 @@ class PCVRParquetDataset(IterableDataset):
 
         Values <= 0 are mapped to 0 (padding). Note: the raw data contains -1
         (missing); currently treated the same way as 0 (padding).
+
+        Returns:
+            A tuple ``(padded, lengths)`` where ``padded`` has shape
+            ``[B, max_len]`` and ``lengths`` has shape ``[B]``.
         """
         offsets = arrow_col.offsets.to_numpy()
         values = arrow_col.values.to_numpy()
+
         padded = np.zeros((B, max_len), dtype=np.int64)
-        use_lens = self._scatter_varlen(offsets, values, max_len, B, padded)
+        lengths = np.zeros(B, dtype=np.int64)
+
+        for i in range(B):
+            start, end = int(offsets[i]), int(offsets[i + 1])
+            raw_len = end - start
+            if raw_len <= 0:
+                continue
+            use_len = min(raw_len, max_len)
+            padded[i, :use_len] = values[start:start + use_len]
+            lengths[i] = use_len
+
         padded[padded <= 0] = 0
-        return padded, use_lens
+        return padded, lengths
 
     # Backwards-compatible alias kept for bench_raw_dataset.py and other
     # external callers that pre-date the rename. New code should call
@@ -509,8 +489,17 @@ class PCVRParquetDataset(IterableDataset):
         """Pad an Arrow ``ListArray<float>`` to shape ``[B, max_dim]``."""
         offsets = arrow_col.offsets.to_numpy()
         values = arrow_col.values.to_numpy()
+
         padded = np.zeros((B, max_dim), dtype=np.float32)
-        self._scatter_varlen(offsets, values, max_dim, B, padded)
+
+        for i in range(B):
+            start, end = int(offsets[i]), int(offsets[i + 1])
+            raw_len = end - start
+            if raw_len <= 0:
+                continue
+            use_len = min(raw_len, max_dim)
+            padded[i, :use_len] = values[start:start + use_len]
+
         return padded
 
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
@@ -603,16 +592,24 @@ class PCVRParquetDataset(IterableDataset):
             lengths = self._buf_seq_lens[domain][:B]
             lengths[:] = 0
 
-            # Fused vectorized path: scatter each side-info column directly
-            # into out[:, c, :], then track per-row max use_len in `lengths`.
+            # Fused path: first collect (offsets, values, vocab_size, col_idx)
+            # for every side-info column, then fill the buffer in a single pass.
             col_data = []
             for ci, slot, vs in side_plan:
                 col = batch.column(ci)
                 col_data.append((col.offsets.to_numpy(), col.values.to_numpy(), vs, ci))
 
             for c, (offs, vals, vs, ci) in enumerate(col_data):
-                use_lens = self._scatter_varlen(offs, vals, max_len, B, out[:, c, :])
-                np.maximum(lengths, use_lens, out=lengths)
+                for i in range(B):
+                    s = int(offs[i])
+                    e = int(offs[i + 1])
+                    rl = e - s
+                    if rl <= 0:
+                        continue
+                    ul = min(rl, max_len)
+                    out[i, c, :ul] = vals[s:s + ul]
+                    if ul > lengths[i]:
+                        lengths[i] = ul
 
             # Values <= 0 -> 0.
             out[out <= 0] = 0
@@ -637,9 +634,16 @@ class PCVRParquetDataset(IterableDataset):
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
                 ts_vals = ts_col.values.to_numpy()
-                # Pad timestamps into shape (B, max_len) via the same vectorized scatter.
+                # Pad timestamps into shape (B, max_len).
                 ts_padded = np.zeros((B, max_len), dtype=np.int64)
-                self._scatter_varlen(ts_offs, ts_vals, max_len, B, ts_padded)
+                for i in range(B):
+                    s = int(ts_offs[i])
+                    e = int(ts_offs[i + 1])
+                    rl = e - s
+                    if rl <= 0:
+                        continue
+                    ul = min(rl, max_len)
+                    ts_padded[i, :ul] = ts_vals[s:s + ul]
 
                 ts_expanded = timestamps.reshape(-1, 1)
                 time_diff = np.maximum(ts_expanded - ts_padded, 0)
@@ -677,7 +681,6 @@ def get_pcvr_data(
     seed: int = 42,
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
-    valid_num_workers: Optional[int] = None,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -696,82 +699,35 @@ def get_pcvr_data(
     import glob as _glob
     pq_files = sorted(_glob.glob(os.path.join(data_dir, '*.parquet')))
 
-    # Filename-based train/valid split: any file whose basename starts with
-    # one of the recognized validation prefixes is treated as the validation
-    # set; the rest are training. This matches the canonical layout where
-    # competitions ship a `valid_*.parquet` (or `val_*` / `eval_*`) alongside
-    # the training shards. Falls back to row-group-ratio split when no such
-    # file is present.
-    valid_prefixes = ('valid_', 'val_', 'eval_')
-    train_files = [f for f in pq_files
-                   if not os.path.basename(f).startswith(valid_prefixes)]
-    valid_files = [f for f in pq_files
-                   if os.path.basename(f).startswith(valid_prefixes)]
+    rg_info = []
+    for f in pq_files:
+        pf = pq.ParquetFile(f)
+        for i in range(pf.metadata.num_row_groups):
+            rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
+    total_rgs = len(rg_info)
 
-    use_filename_split = bool(train_files and valid_files)
+    n_valid_rgs = max(1, int(total_rgs * valid_ratio))
+    n_train_rgs = total_rgs - n_valid_rgs
 
-    if use_filename_split:
-        # Apply train_ratio at the row-group level inside the train_files set.
-        train_rg_info = []
-        for f in train_files:
-            pf = pq.ParquetFile(f)
-            for i in range(pf.metadata.num_row_groups):
-                train_rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
-        if train_ratio < 1.0:
-            n_keep = max(1, int(len(train_rg_info) * train_ratio))
-            kept_files = sorted({rg[0] for rg in train_rg_info[:n_keep]})
-            train_files = kept_files
-            logging.info(f"train_ratio={train_ratio}: kept {len(kept_files)} train files "
-                         f"({n_keep} row groups)")
-        train_rows = sum(r[2] for r in train_rg_info)
-        valid_rows = sum(pq.ParquetFile(f).metadata.num_rows for f in valid_files)
-        logging.info(f"Filename split: train={train_files} ({train_rows} rows), "
-                     f"valid={valid_files} ({valid_rows} rows)")
-        train_path: Any = train_files
-        valid_path: Any = valid_files
-        train_range = None
-        valid_range = None
-    else:
-        rg_info = []
-        for f in pq_files:
-            pf = pq.ParquetFile(f)
-            for i in range(pf.metadata.num_row_groups):
-                rg_info.append((f, i, pf.metadata.row_group(i).num_rows))
-        total_rgs = len(rg_info)
+    # train_ratio: use only the first N% of the training Row Groups.
+    if train_ratio < 1.0:
+        n_train_rgs = max(1, int(n_train_rgs * train_ratio))
+        logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
 
-        # When the dataset has fewer than 2 row groups (smoke-test datasets),
-        # row-group-level slicing collapses one side to zero rows. Fall back
-        # to full overlap: train and eval iterate the same data.
-        if total_rgs < 2:
-            train_range = (0, total_rgs)
-            valid_range = (0, total_rgs)
-            train_rows = valid_rows = sum(r[2] for r in rg_info)
-            logging.info(
-                f"Row Group count={total_rgs} (<2): train and valid both use all "
-                f"{train_rows} rows (smoke-test mode)")
-        else:
-            n_valid_rgs = max(1, int(total_rgs * valid_ratio))
-            n_train_rgs = total_rgs - n_valid_rgs
-            if train_ratio < 1.0:
-                n_train_rgs = max(1, int(n_train_rgs * train_ratio))
-                logging.info(f"train_ratio={train_ratio}: using {n_train_rgs} train Row Groups")
-            train_range = (0, n_train_rgs)
-            valid_range = (n_train_rgs, total_rgs)
-            train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
-            valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
-            logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
-                         f"{n_valid_rgs} valid ({valid_rows} rows)")
-        train_path = data_dir
-        valid_path = data_dir
+    train_rows = sum(r[2] for r in rg_info[:n_train_rgs])
+    valid_rows = sum(r[2] for r in rg_info[n_train_rgs:])
+
+    logging.info(f"Row Group split: {n_train_rgs} train ({train_rows} rows), "
+                 f"{n_valid_rgs} valid ({valid_rows} rows)")
 
     train_dataset = PCVRParquetDataset(
-        parquet_path=train_path,
+        parquet_path=data_dir,
         schema_path=schema_path,
         batch_size=batch_size,
         seq_max_lens=seq_max_lens,
         shuffle=shuffle_train,
         buffer_batches=buffer_batches,
-        row_group_range=train_range,
+        row_group_range=(0, n_train_rgs),
         clip_vocab=clip_vocab,
     )
 
@@ -787,28 +743,21 @@ def get_pcvr_data(
     )
 
     valid_dataset = PCVRParquetDataset(
-        parquet_path=valid_path,
+        parquet_path=data_dir,
         schema_path=schema_path,
         batch_size=batch_size,
         seq_max_lens=seq_max_lens,
         shuffle=False,
         buffer_batches=0,
-        row_group_range=valid_range,
+        row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
     )
-    if valid_num_workers is None:
-        valid_num_workers = min(num_workers, 2)
-    _valid_kw = {}
-    if valid_num_workers > 0:
-        _valid_kw['persistent_workers'] = True
-        _valid_kw['prefetch_factor'] = 2
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
-        num_workers=valid_num_workers, pin_memory=use_cuda, **_valid_kw,
+        num_workers=0, pin_memory=use_cuda,
     )
 
     logging.info(f"Parquet train: {train_rows} rows, valid: {valid_rows} rows, "
-                 f"batch_size={batch_size}, buffer_batches={buffer_batches}, "
-                 f"valid_num_workers={valid_num_workers}")
+                 f"batch_size={batch_size}, buffer_batches={buffer_batches}")
 
     return train_loader, valid_loader, train_dataset
