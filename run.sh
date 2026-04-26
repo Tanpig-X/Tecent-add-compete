@@ -31,25 +31,29 @@ export TRAIN_LOG_PATH="${TRAIN_LOG_PATH:-${SCRIPT_DIR}/logs}"
 export TRAIN_TF_EVENTS_PATH="${TRAIN_TF_EVENTS_PATH:-${SCRIPT_DIR}/tb}"
 
 # ---------------------------------------------------------------------------
-# Pack A config: GroupNSTokenizer (official ns_groups.json) + RoPE +
-#   warmup-cosine LR scheduler.
+# Pack A config: RankMixer NS tokenizer + RoPE + warmup-cosine LR scheduler.
 #
-# IMPORTANT: data-pipeline knobs (batch_size, num_workers, buffer_batches,
-# seq_max_lens) are kept at the original Taiji-baseline values so that this
-# run uses the same memory footprint as your prior baseline. The first time
-# Pack A was tried with batch=1024 / num_workers=16 / buffer_batches=64 +
-# doubled seq lengths it OOM-killed the worker (per-worker shuffle buffer
-# was ~18 GB × 16 workers). We can re-introduce those knobs incrementally
-# once a baseline-memory run confirms Pack A trains end-to-end.
+# We use RankMixer (not Group) for the active config because:
+#   - GroupNSTokenizer issues ~33 small CUDA ops per forward (11 small cats
+#     + 11 small Linears + 11 SiLU), vs RankMixer's ~15. On H20 the
+#     per-kernel launch overhead dominates over the actual matmul work,
+#     making Group ~3x slower end-to-end at batch_size=256. The semantic
+#     prior from official ns_groups doesn't justify a 3x throughput hit at
+#     this batch size.
+#   - Keep the algorithmic Pack A improvements that DON'T cost throughput:
+#     RoPE (small attention overhead), warmup+cosine LR scheduler.
 #
-# T = num_queries*num_seq_domains + num_ns
-#   = 1*4 + (7 user_int + 1 user_dense + 4 item_int) = 16
+# Data-pipeline knobs are kept at baseline-memory values to avoid the OOM
+# we hit with batch=1024/buffer=64 earlier.
+#
+# T = num_queries*num_seq + (user_ns + item_ns + 1 user_dense)
+#   = 2*4 + (5 + 2 + 1) = 16
 #   d_model=64 % T(16) == 0  ✓
 # ---------------------------------------------------------------------------
 python3 -u "${SCRIPT_DIR}/train.py" \
-    --ns_tokenizer_type group \
-    --ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
-    --num_queries 1 \
+    --ns_tokenizer_type rankmixer \
+    --user_ns_tokens 5 --item_ns_tokens 2 --num_queries 2 \
+    --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --use_rope \
     --rope_base 10000 \
@@ -64,13 +68,17 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     "$@"
 
 # ---------------------------------------------------------------------------
-# Backup config: RankMixer NS tokenizer (no ns_groups.json needed)
-# Use this if the official ns_groups becomes unavailable.
+# Optional: GroupNSTokenizer + official ns_groups.json
+#
+# Slower (~3x at batch_size=256 due to many small CUDA kernels) but the
+# semantic feature prior may give a small AUC lift if you can amortize the
+# kernel launches with a much larger batch. Try --batch_size 1024 first;
+# if it still OOMs, drop num_workers to 4 and buffer_batches to 4.
 # ---------------------------------------------------------------------------
 # python3 -u "${SCRIPT_DIR}/train.py" \
-#     --ns_tokenizer_type rankmixer \
-#     --user_ns_tokens 5 --item_ns_tokens 2 --num_queries 2 \
-#     --ns_groups_json "" \
+#     --ns_tokenizer_type group \
+#     --ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
+#     --num_queries 1 \
 #     --emb_skip_threshold 1000000 \
 #     --use_rope --rope_base 10000 \
 #     --batch_size 256 --num_workers 8 --buffer_batches 8 \
