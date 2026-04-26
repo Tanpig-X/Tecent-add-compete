@@ -27,3 +27,4 @@ __MACOSX/
 .vscode/
 .idea/
 *.swp
+experiments/lr_schedule.png

@@ -348,6 +348,19 @@ class PCVRHyFormerRankingTrainer:
 
                 if self.writer:
                     self.writer.add_scalar('Loss/train', loss, total_step)
+                    # Log live LR so the schedule shape (warmup → cosine →
+                    # flat) is visible in TensorBoard alongside loss/AUC.
+                    self.writer.add_scalar(
+                        'LR/dense',
+                        self.dense_optimizer.param_groups[0]['lr'],
+                        total_step,
+                    )
+                    if self.sparse_optimizer is not None:
+                        self.writer.add_scalar(
+                            'LR/sparse',
+                            self.sparse_optimizer.param_groups[0]['lr'],
+                            total_step,
+                        )
 
                 train_pbar.set_postfix({"loss": f"{loss:.4f}"})
 
