@@ -6,9 +6,10 @@ uses pointwise BCE / Focal loss and evaluates Binary AUC + binary logloss.
 
 import os
 import glob
+import math
 import shutil
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -60,6 +61,9 @@ class PCVRHyFormerRankingTrainer:
         train_config: Optional[Dict[str, Any]] = None,
         use_amp: bool = True,
         amp_dtype: torch.dtype = torch.bfloat16,
+        warmup_steps: int = 0,
+        lr_decay_steps: int = 0,
+        min_lr_factor: float = 0.1,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -114,10 +118,40 @@ class PCVRHyFormerRankingTrainer:
         self.use_amp: bool = bool(use_amp and device.startswith('cuda'))
         self.amp_dtype: torch.dtype = amp_dtype
 
+        # LR scheduler: warmup → cosine → flat at min_lr_factor*base_lr.
+        # When both warmup_steps and lr_decay_steps are 0, scheduler is a no-op
+        # (constant LR), preserving backward compatibility.
+        self.warmup_steps: int = max(0, int(warmup_steps))
+        self.lr_decay_steps: int = max(0, int(lr_decay_steps))
+        self.min_lr_factor: float = float(min_lr_factor)
+        self.lr_schedulers: List[torch.optim.lr_scheduler.LambdaLR] = []
+        if self.warmup_steps > 0 or self.lr_decay_steps > 0:
+            warmup = self.warmup_steps
+            decay = self.lr_decay_steps
+            min_factor = self.min_lr_factor
+
+            def lr_lambda(step: int) -> float:
+                if warmup > 0 and step < warmup:
+                    return (step + 1) / warmup
+                if decay <= 0:
+                    return 1.0
+                progress = min(1.0, (step - warmup) / decay)
+                cos = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return min_factor + (1.0 - min_factor) * cos
+
+            self.lr_schedulers.append(
+                torch.optim.lr_scheduler.LambdaLR(self.dense_optimizer, lr_lambda))
+            if self.sparse_optimizer is not None:
+                self.lr_schedulers.append(
+                    torch.optim.lr_scheduler.LambdaLR(self.sparse_optimizer, lr_lambda))
+
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
-                     f"use_amp={self.use_amp} (dtype={self.amp_dtype})")
+                     f"use_amp={self.use_amp} (dtype={self.amp_dtype}), "
+                     f"warmup_steps={self.warmup_steps}, "
+                     f"lr_decay_steps={self.lr_decay_steps}, "
+                     f"min_lr_factor={self.min_lr_factor}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -431,6 +465,8 @@ class PCVRHyFormerRankingTrainer:
         self.dense_optimizer.step()
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.step()
+        for sched in self.lr_schedulers:
+            sched.step()
 
         return loss.item()
 

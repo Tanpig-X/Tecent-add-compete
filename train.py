@@ -80,6 +80,16 @@ def parse_args() -> argparse.Namespace:
                         help='Disable BF16 autocast')
     parser.add_argument('--deterministic', action='store_true', default=False,
                         help='Force cuDNN deterministic (slower but reproducible)')
+    parser.add_argument('--warmup_steps', type=int, default=0,
+                        help='Linear LR warmup over the first N optimizer steps '
+                             '(0 = no warmup, scheduler inactive unless '
+                             '--lr_decay_steps is also set)')
+    parser.add_argument('--lr_decay_steps', type=int, default=0,
+                        help='Cosine LR decay length (in steps) after warmup. '
+                             '0 = no decay; LR stays at base after warmup.')
+    parser.add_argument('--min_lr_factor', type=float, default=0.1,
+                        help='Floor LR as a fraction of base LR after the cosine '
+                             'decay completes (only used when lr_decay_steps>0).')
     parser.add_argument('--buffer_batches', type=int, default=20,
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
@@ -379,6 +389,9 @@ def main() -> None:
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
         use_amp=args.use_amp,
+        warmup_steps=args.warmup_steps,
+        lr_decay_steps=args.lr_decay_steps,
+        min_lr_factor=args.min_lr_factor,
     )
 
     trainer.train()

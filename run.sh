@@ -30,29 +30,48 @@ export TRAIN_CKPT_PATH="${TRAIN_CKPT_PATH:-${SCRIPT_DIR}/ckpt}"
 export TRAIN_LOG_PATH="${TRAIN_LOG_PATH:-${SCRIPT_DIR}/logs}"
 export TRAIN_TF_EVENTS_PATH="${TRAIN_TF_EVENTS_PATH:-${SCRIPT_DIR}/tb}"
 
-# ---- Active config: GroupNSTokenizer driven by ns_groups.json ----
-# 40-row smoke-test data → small batch_size + few workers + a handful of epochs.
-# AMP / TF32 / cuDNN benchmark are on by default in train.py.
-# python3 -u "${SCRIPT_DIR}/train.py" \
-#     --ns_tokenizer_type group \
-#     --ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
-#     --num_queries 1 \
-#     --emb_skip_threshold 1000000 \
-#     --batch_size 8 \
-#     --num_workers 4 \
-#     --buffer_batches 4 \
-#     --num_epochs 5 \
-#     --eval_every_n_steps 0 \
-#     "$@"
-
-# ---- Alternative config: RankMixer NS tokenizer (no ns_groups.json required) ----
+# ---------------------------------------------------------------------------
+# Pack A config: GroupNSTokenizer (official ns_groups.json) + RoPE +
+#   warmup-cosine LR scheduler + bigger batch / longer user history.
+#
+# Defaults below are tuned for 200M-scale Taiji runs on H20 (97 GB).
+# For the local 1000-row smoke test you can override with smaller values:
+#     bash run.sh --batch_size 64 --warmup_steps 50 --lr_decay_steps 0
+#
+# T = num_queries*num_seq_domains + num_ns
+#   = 1*4 + (7 user_int + 1 user_dense + 4 item_int) = 16
+#   d_model=64 % T(16) == 0  ✓
+# ---------------------------------------------------------------------------
 python3 -u "${SCRIPT_DIR}/train.py" \
-    --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 5 \
-    --item_ns_tokens 2 \
-    --num_queries 2 \
-    --ns_groups_json "" \
+    --ns_tokenizer_type group \
+    --ns_groups_json "${SCRIPT_DIR}/ns_groups.json" \
+    --num_queries 1 \
     --emb_skip_threshold 1000000 \
-    --batch_size 8 \
-    --num_workers 4 \
+    --use_rope \
+    --rope_base 10000 \
+    --batch_size 1024 \
+    --num_workers 16 \
+    --buffer_batches 64 \
+    --seq_max_lens 'seq_a:512,seq_b:512,seq_c:1024,seq_d:1024' \
+    --warmup_steps 2000 \
+    --lr_decay_steps 200000 \
+    --min_lr_factor 0.1 \
+    --lr 2e-4 \
+    --sparse_lr 0.05 \
     "$@"
+
+# ---------------------------------------------------------------------------
+# Backup config: RankMixer NS tokenizer (no ns_groups.json needed)
+# Use this if the official ns_groups becomes unavailable.
+# ---------------------------------------------------------------------------
+# python3 -u "${SCRIPT_DIR}/train.py" \
+#     --ns_tokenizer_type rankmixer \
+#     --user_ns_tokens 5 --item_ns_tokens 2 --num_queries 2 \
+#     --ns_groups_json "" \
+#     --emb_skip_threshold 1000000 \
+#     --use_rope --rope_base 10000 \
+#     --batch_size 1024 --num_workers 16 --buffer_batches 64 \
+#     --seq_max_lens 'seq_a:512,seq_b:512,seq_c:1024,seq_d:1024' \
+#     --warmup_steps 2000 --lr_decay_steps 200000 --min_lr_factor 0.1 \
+#     --lr 2e-4 --sparse_lr 0.05 \
+#     "$@"

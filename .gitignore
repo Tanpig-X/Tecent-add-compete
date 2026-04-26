@@ -9,10 +9,15 @@ taac_data/schema.json
 
 # Training outputs
 ckpt/
+ckpt_*/
 logs/
+logs_*/
 tb/
+tb_*/
 *.log
 events.out.tfevents.*
+experiments/runs/
+experiments/results.csv
 
 # OS junk
 .DS_Store
