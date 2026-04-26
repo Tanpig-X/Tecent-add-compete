@@ -32,11 +32,15 @@ export TRAIN_TF_EVENTS_PATH="${TRAIN_TF_EVENTS_PATH:-${SCRIPT_DIR}/tb}"
 
 # ---------------------------------------------------------------------------
 # Pack A config: GroupNSTokenizer (official ns_groups.json) + RoPE +
-#   warmup-cosine LR scheduler + bigger batch / longer user history.
+#   warmup-cosine LR scheduler.
 #
-# Defaults below are tuned for 200M-scale Taiji runs on H20 (97 GB).
-# For the local 1000-row smoke test you can override with smaller values:
-#     bash run.sh --batch_size 64 --warmup_steps 50 --lr_decay_steps 0
+# IMPORTANT: data-pipeline knobs (batch_size, num_workers, buffer_batches,
+# seq_max_lens) are kept at the original Taiji-baseline values so that this
+# run uses the same memory footprint as your prior baseline. The first time
+# Pack A was tried with batch=1024 / num_workers=16 / buffer_batches=64 +
+# doubled seq lengths it OOM-killed the worker (per-worker shuffle buffer
+# was ~18 GB × 16 workers). We can re-introduce those knobs incrementally
+# once a baseline-memory run confirms Pack A trains end-to-end.
 #
 # T = num_queries*num_seq_domains + num_ns
 #   = 1*4 + (7 user_int + 1 user_dense + 4 item_int) = 16
@@ -49,14 +53,13 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --emb_skip_threshold 1000000 \
     --use_rope \
     --rope_base 10000 \
-    --batch_size 1024 \
-    --num_workers 16 \
-    --buffer_batches 64 \
-    --seq_max_lens 'seq_a:512,seq_b:512,seq_c:1024,seq_d:1024' \
+    --batch_size 256 \
+    --num_workers 8 \
+    --buffer_batches 8 \
     --warmup_steps 2000 \
     --lr_decay_steps 200000 \
     --min_lr_factor 0.1 \
-    --lr 2e-4 \
+    --lr 1e-4 \
     --sparse_lr 0.05 \
     "$@"
 
@@ -70,8 +73,18 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #     --ns_groups_json "" \
 #     --emb_skip_threshold 1000000 \
 #     --use_rope --rope_base 10000 \
-#     --batch_size 1024 --num_workers 16 --buffer_batches 64 \
-#     --seq_max_lens 'seq_a:512,seq_b:512,seq_c:1024,seq_d:1024' \
+#     --batch_size 256 --num_workers 8 --buffer_batches 8 \
 #     --warmup_steps 2000 --lr_decay_steps 200000 --min_lr_factor 0.1 \
-#     --lr 2e-4 --sparse_lr 0.05 \
+#     --lr 1e-4 --sparse_lr 0.05 \
 #     "$@"
+
+# ---------------------------------------------------------------------------
+# After confirming the baseline-memory Pack A runs OK, you can try larger
+# batches incrementally. Each ~2x batch roughly doubles the per-worker
+# shuffle-buffer footprint; bump conservatively:
+#   --batch_size 512 --num_workers 8 --buffer_batches 8       # ~2x baseline mem
+#   --batch_size 512 --num_workers 8 --buffer_batches 16      # ~4x baseline mem
+#   --batch_size 1024 --num_workers 8 --buffer_batches 8      # ~4x baseline mem
+# Longer user history is a separate axis and ALSO doubles per-batch memory:
+#   --seq_max_lens 'seq_a:512,seq_b:512,seq_c:1024,seq_d:1024'   # ~2x
+# ---------------------------------------------------------------------------
