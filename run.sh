@@ -45,15 +45,29 @@ export TRAIN_TF_EVENTS_PATH="${TRAIN_TF_EVENTS_PATH:-${SCRIPT_DIR}/tb}"
 #     --eval_every_n_steps 0 \
 #     "$@"
 
-# ---- Alternative config: RankMixer NS tokenizer (no ns_groups.json required) ----
+# ---- Active config: RankMixer + Pack B (LR schedule + weight_decay + EMA) ----
+# Pack B layers three near-zero-cost optimisation tricks on top of the existing
+# rankmixer config. None changes per-step compute by more than ~1%:
+#   --warmup_steps / --lr_decay_steps / --min_lr_factor :
+#       warmup → cosine → flat schedule (pure scalar math, ~0% overhead)
+#   --weight_decay :
+#       AdamW weight_decay on the dense backbone (~0% cost)
+#   --ema_decay :
+#       EMA shadow over dense params; eval uses EMA weights, train uses live
+#       weights (one lerp_ per dense param per step, <1% overhead)
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
     --item_ns_tokens 2 \
     --num_queries 2 \
     --ns_groups_json "" \
-    --num_hyformer_blocks 4\
+    --num_hyformer_blocks 2 \
     --emb_skip_threshold 1000000 \
     --batch_size 256 \
     --num_workers 8 \
+    --warmup_steps 2000 \
+    --lr_decay_steps 200000 \
+    --min_lr_factor 0.1 \
+    --weight_decay 0.01 \
+    --ema_decay 0.999 \
     "$@"

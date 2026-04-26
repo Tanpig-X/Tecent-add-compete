@@ -6,9 +6,10 @@ uses pointwise BCE / Focal loss and evaluates Binary AUC + binary logloss.
 
 import os
 import glob
+import math
 import shutil
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -17,6 +18,68 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
+
+
+class _DenseEMA:
+    """In-place exponential-moving-average shadow for a list of dense tensors.
+
+    Update cost: one ``lerp_`` per parameter per step (negligible vs the
+    backbone forward/backward). Memory cost: one extra fp32 copy of the
+    dense parameters (~8 MB for the current ~2 M dense params).
+
+    Usage:
+        ema = _DenseEMA(dense_params, decay=0.999)
+        ...
+        # after each optimizer.step():
+        ema.update()
+        ...
+        # for evaluation:
+        with ema.swap_in():
+            run_validation()
+    """
+
+    def __init__(self, params: List[torch.nn.Parameter], decay: float) -> None:
+        self.decay: float = float(decay)
+        self.params: List[torch.nn.Parameter] = list(params)
+        # Shadow tensors live on the same device/dtype as the parameters.
+        self.shadow: List[torch.Tensor] = [p.detach().clone() for p in self.params]
+        self._backup: Optional[List[torch.Tensor]] = None
+
+    @torch.no_grad()
+    def update(self) -> None:
+        # shadow = decay * shadow + (1 - decay) * param
+        for p, s in zip(self.params, self.shadow):
+            s.mul_(self.decay).add_(p.detach(), alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def _swap_into_params(self) -> None:
+        self._backup = [p.detach().clone() for p in self.params]
+        for p, s in zip(self.params, self.shadow):
+            p.data.copy_(s)
+
+    @torch.no_grad()
+    def _restore_params(self) -> None:
+        if self._backup is None:
+            return
+        for p, b in zip(self.params, self._backup):
+            p.data.copy_(b)
+        self._backup = None
+
+    def swap_in(self):
+        """Context manager that swaps EMA weights into the model for evaluation
+        and restores the live training weights on exit.
+        """
+        ema = self
+
+        class _Ctx:
+            def __enter__(self_inner):
+                ema._swap_into_params()
+
+            def __exit__(self_inner, exc_type, exc_val, exc_tb):
+                ema._restore_params()
+                return False
+
+        return _Ctx()
 
 from utils import sigmoid_focal_loss, EarlyStopping
 from model import ModelInput
@@ -60,6 +123,11 @@ class PCVRHyFormerRankingTrainer:
         train_config: Optional[Dict[str, Any]] = None,
         use_amp: bool = True,
         amp_dtype: torch.dtype = torch.bfloat16,
+        warmup_steps: int = 0,
+        lr_decay_steps: int = 0,
+        min_lr_factor: float = 0.1,
+        weight_decay: float = 0.0,
+        ema_decay: float = 0.0,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -75,6 +143,8 @@ class PCVRHyFormerRankingTrainer:
         self.ns_groups_path: Optional[str] = ns_groups_path
 
         # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
+        # weight_decay > 0 acts only on the dense backbone — sparse Embeddings
+        # are regularised separately via sparse_weight_decay (Adagrad).
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
         if hasattr(model, 'get_sparse_params'):
             sparse_params = model.get_sparse_params()
@@ -82,18 +152,20 @@ class PCVRHyFormerRankingTrainer:
             sparse_param_count = sum(p.numel() for p in sparse_params)
             dense_param_count = sum(p.numel() for p in dense_params)
             logging.info(f"Sparse params: {len(sparse_params)} tensors, {sparse_param_count:,} parameters (Adagrad lr={sparse_lr})")
-            logging.info(f"Dense params: {len(dense_params)} tensors, {dense_param_count:,} parameters (AdamW lr={lr})")
+            logging.info(f"Dense params: {len(dense_params)} tensors, {dense_param_count:,} parameters (AdamW lr={lr}, weight_decay={weight_decay})")
             self.sparse_optimizer = torch.optim.Adagrad(
                 sparse_params, lr=sparse_lr, weight_decay=sparse_weight_decay
             )
             self.dense_optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-                dense_params, lr=lr, betas=(0.9, 0.98)
+                dense_params, lr=lr, betas=(0.9, 0.98), weight_decay=weight_decay,
             )
+            self._dense_params: List[torch.nn.Parameter] = list(dense_params)
         else:
             self.sparse_optimizer = None
             self.dense_optimizer = torch.optim.AdamW(
-                model.parameters(), lr=lr, betas=(0.9, 0.98)
+                model.parameters(), lr=lr, betas=(0.9, 0.98), weight_decay=weight_decay,
             )
+            self._dense_params = list(model.parameters())
 
         self.num_epochs: int = num_epochs
         self.device: str = device
@@ -114,10 +186,50 @@ class PCVRHyFormerRankingTrainer:
         self.use_amp: bool = bool(use_amp and device.startswith('cuda'))
         self.amp_dtype: torch.dtype = amp_dtype
 
+        # LR scheduler: warmup → cosine → flat at min_lr_factor*base_lr.
+        # When both warmup_steps and lr_decay_steps are 0 the scheduler is a
+        # no-op (constant LR), preserving prior behaviour.
+        self.warmup_steps: int = max(0, int(warmup_steps))
+        self.lr_decay_steps: int = max(0, int(lr_decay_steps))
+        self.min_lr_factor: float = float(min_lr_factor)
+        self.lr_schedulers: List[torch.optim.lr_scheduler.LambdaLR] = []
+        if self.warmup_steps > 0 or self.lr_decay_steps > 0:
+            warmup = self.warmup_steps
+            decay = self.lr_decay_steps
+            min_factor = self.min_lr_factor
+
+            def lr_lambda(step: int) -> float:
+                if warmup > 0 and step < warmup:
+                    return (step + 1) / warmup
+                if decay <= 0:
+                    return 1.0
+                progress = min(1.0, (step - warmup) / decay)
+                cos = 0.5 * (1.0 + math.cos(math.pi * progress))
+                return min_factor + (1.0 - min_factor) * cos
+
+            self.lr_schedulers.append(
+                torch.optim.lr_scheduler.LambdaLR(self.dense_optimizer, lr_lambda))
+            if self.sparse_optimizer is not None:
+                self.lr_schedulers.append(
+                    torch.optim.lr_scheduler.LambdaLR(self.sparse_optimizer, lr_lambda))
+
+        # EMA over dense params only (sparse Adagrad already produces a moving
+        # estimate). Disabled when ema_decay <= 0.
+        self.ema_decay: float = float(ema_decay)
+        self.ema: Optional[_DenseEMA] = None
+        if self.ema_decay > 0.0 and self._dense_params:
+            self.ema = _DenseEMA(self._dense_params, decay=self.ema_decay)
+            logging.info(f"Dense EMA enabled with decay={self.ema_decay}")
+
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
-                     f"use_amp={self.use_amp} (dtype={self.amp_dtype})")
+                     f"use_amp={self.use_amp} (dtype={self.amp_dtype}), "
+                     f"warmup_steps={self.warmup_steps}, "
+                     f"lr_decay_steps={self.lr_decay_steps}, "
+                     f"min_lr_factor={self.min_lr_factor}, "
+                     f"weight_decay={weight_decay}, "
+                     f"ema_decay={self.ema_decay}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -314,6 +426,19 @@ class PCVRHyFormerRankingTrainer:
 
                 if self.writer:
                     self.writer.add_scalar('Loss/train', loss, total_step)
+                    # Live LR so the schedule shape (warmup → cosine → flat)
+                    # is visible alongside loss/AUC.
+                    self.writer.add_scalar(
+                        'LR/dense',
+                        self.dense_optimizer.param_groups[0]['lr'],
+                        total_step,
+                    )
+                    if self.sparse_optimizer is not None:
+                        self.writer.add_scalar(
+                            'LR/sparse',
+                            self.sparse_optimizer.param_groups[0]['lr'],
+                            total_step,
+                        )
 
                 train_pbar.set_postfix({"loss": f"{loss:.4f}"})
 
@@ -431,6 +556,10 @@ class PCVRHyFormerRankingTrainer:
         self.dense_optimizer.step()
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.step()
+        for sched in self.lr_schedulers:
+            sched.step()
+        if self.ema is not None:
+            self.ema.update()
 
         return loss.item()
 
@@ -438,12 +567,21 @@ class PCVRHyFormerRankingTrainer:
         """Run validation over ``self.valid_loader`` and return ``(AUC, logloss)``.
 
         NaN predictions (which can arise from exploding gradients) are filtered
-        out before computing both metrics.
+        out before computing both metrics. When EMA is enabled, validation runs
+        against the EMA shadow weights (live training weights are restored on
+        exit), which typically gives a smoother and slightly higher AUC.
         """
         print("Start Evaluation (PCVRHyFormer) - validation")
         self.model.eval()
         if not epoch:
             epoch = -1
+
+        if self.ema is not None:
+            with self.ema.swap_in():
+                return self._run_evaluate_loop()
+        return self._run_evaluate_loop()
+
+    def _run_evaluate_loop(self) -> Tuple[float, float]:
 
         pbar = tqdm(enumerate(self.valid_loader), total=len(self.valid_loader))
 
