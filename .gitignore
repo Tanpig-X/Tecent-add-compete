@@ -1,0 +1,24 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local data + auto-generated schema
+data/
+taac_data/schema.json
+
+# Training outputs
+ckpt/
+logs/
+tb/
+*.log
+events.out.tfevents.*
+
+# OS junk
+.DS_Store
+__MACOSX/
+
+# Editor
+.vscode/
+.idea/
+*.swp

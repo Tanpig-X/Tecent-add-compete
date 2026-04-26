@@ -233,20 +233,13 @@ class EarlyStopping:
         self.best_saved_score = score
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, deterministic: bool = False) -> None:
     """Seed every RNG that can influence training reproducibility.
 
     Seeds ``random``, the ``PYTHONHASHSEED`` env var, NumPy, the CPU
-    PyTorch generator and all CUDA generators, then forces cuDNN into
-    deterministic mode.
-
-    Note that full bitwise determinism on GPU also requires disabling
-    cuDNN auto-tuning (``torch.backends.cudnn.benchmark = False``) and may
-    come with a non-trivial throughput cost; this helper intentionally
-    only toggles ``deterministic`` to preserve speed for common use cases.
-
-    Args:
-        seed: Non-negative integer seed shared by all RNGs listed above.
+    PyTorch generator and all CUDA generators. ``deterministic`` toggles
+    the cuDNN deterministic flag separately so callers can opt into
+    bitwise reproducibility at the cost of throughput.
     """
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -254,7 +247,21 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+
+
+def enable_fast_math() -> None:
+    """Enable TF32 matmul + cuDNN autotune for maximum throughput on H100/H20.
+
+    Only safe when strict bitwise reproducibility is not required. Pairs
+    well with BF16 ``torch.autocast``.
+    """
+    torch.set_float32_matmul_precision('high')
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
 
 
 def sigmoid_focal_loss(
