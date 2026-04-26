@@ -18,7 +18,7 @@ from typing import List, Tuple
 
 import torch
 
-from utils import set_seed, enable_fast_math, EarlyStopping, create_logger
+from utils import set_seed, EarlyStopping, create_logger
 from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
@@ -232,10 +232,18 @@ def main() -> None:
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
     Path(args.tf_events_dir).mkdir(parents=True, exist_ok=True)
 
-    # Initialize logger and RNG.
-    set_seed(args.seed, deterministic=args.deterministic)
-    if not args.deterministic:
-        enable_fast_math()
+    # Initialize logger and RNG. Inlined here (instead of calling utils helpers)
+    # so the script works against the original utils.py too — Taiji deployments
+    # that bundle a stale utils.py won't break on missing symbols.
+    set_seed(args.seed)
+    if args.deterministic:
+        torch.backends.cudnn.deterministic = True
+    else:
+        torch.set_float32_matmul_precision('high')
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
     create_logger(os.path.join(args.log_dir, 'train.log'))
     logging.info(f"Args: {vars(args)}")
 
