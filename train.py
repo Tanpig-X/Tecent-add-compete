@@ -18,7 +18,7 @@ from typing import List, Tuple
 
 import torch
 
-from utils import set_seed, enable_fast_math, EarlyStopping, create_logger
+from utils import set_seed, EarlyStopping, create_logger
 from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
@@ -71,33 +71,6 @@ def parse_args() -> argparse.Namespace:
     # Data pipeline.
     parser.add_argument('--num_workers', type=int, default=16,
                         help='Number of DataLoader workers')
-    parser.add_argument('--valid_num_workers', type=int, default=-1,
-                        help='Validation DataLoader workers '
-                             '(-1 = min(num_workers, 2))')
-    parser.add_argument('--amp', dest='use_amp', action='store_true', default=True,
-                        help='Enable BF16 autocast for forward+loss (default on)')
-    parser.add_argument('--no_amp', dest='use_amp', action='store_false',
-                        help='Disable BF16 autocast')
-    parser.add_argument('--deterministic', action='store_true', default=False,
-                        help='Force cuDNN deterministic (slower but reproducible)')
-    parser.add_argument('--warmup_steps', type=int, default=0,
-                        help='Linear LR warmup over the first N optimizer steps '
-                             '(0 = no warmup, scheduler inactive unless '
-                             '--lr_decay_steps is also set)')
-    parser.add_argument('--lr_decay_steps', type=int, default=0,
-                        help='Cosine LR decay length (in steps) after warmup. '
-                             '0 = no decay; LR stays at base after warmup.')
-    parser.add_argument('--min_lr_factor', type=float, default=0.1,
-                        help='Floor LR as a fraction of base LR after the cosine '
-                             'decay completes (only used when lr_decay_steps>0).')
-    parser.add_argument('--weight_decay', type=float, default=0.0,
-                        help='AdamW weight_decay applied to dense backbone '
-                             'parameters (0 = none). Sparse Embeddings use '
-                             '--sparse_weight_decay instead.')
-    parser.add_argument('--ema_decay', type=float, default=0.0,
-                        help='EMA decay over dense parameters; the EMA shadow '
-                             'is used for evaluation. 0 = disabled. Typical '
-                             'values: 0.999 (slow) - 0.9999 (very slow).')
     parser.add_argument('--buffer_batches', type=int, default=20,
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
@@ -241,9 +214,7 @@ def main() -> None:
     Path(args.tf_events_dir).mkdir(parents=True, exist_ok=True)
 
     # Initialize logger and RNG.
-    set_seed(args.seed, deterministic=args.deterministic)
-    if not args.deterministic:
-        enable_fast_math()
+    set_seed(args.seed)
     create_logger(os.path.join(args.log_dir, 'train.log'))
     logging.info(f"Args: {vars(args)}")
 
@@ -256,22 +227,8 @@ def main() -> None:
     else:
         schema_path = os.path.join(args.data_dir, 'schema.json')
 
-    # Auto-bootstrap schema.json from the parquet files when missing.
-    # This makes the script self-contained on a remote training server where
-    # the platform delivers raw parquet via TRAIN_DATA_PATH but no schema.
-    # Falls back to ckpt_dir when data_dir is mounted read-only (common on
-    # managed training platforms with NAS/OSS-backed input).
     if not os.path.exists(schema_path):
-        logging.info(f"schema file not found at {schema_path}; "
-                     f"auto-generating from parquet files in {args.data_dir}")
-        from prepare_data import write_schema
-        try:
-            schema_path = write_schema(args.data_dir)
-        except (PermissionError, OSError) as e:
-            fallback = os.path.join(args.ckpt_dir, 'schema.json')
-            logging.warning(f"could not write schema to {args.data_dir}: {e}; "
-                            f"writing to {fallback} instead (data dir read-only?)")
-            schema_path = write_schema(args.data_dir, out_path=fallback)
+        raise FileNotFoundError(f"schema file not found at {schema_path}")
 
     # Parse per-domain sequence-length overrides.
     seq_max_lens = {}
@@ -282,8 +239,6 @@ def main() -> None:
         logging.info(f"Seq max_lens override: {seq_max_lens}")
 
     logging.info("Using Parquet data format (IterableDataset)")
-    valid_workers = args.valid_num_workers if args.valid_num_workers >= 0 \
-        else min(args.num_workers, 2)
     train_loader, valid_loader, pcvr_dataset = get_pcvr_data(
         data_dir=args.data_dir,
         schema_path=schema_path,
@@ -294,7 +249,6 @@ def main() -> None:
         buffer_batches=args.buffer_batches,
         seed=args.seed,
         seq_max_lens=seq_max_lens,
-        valid_num_workers=valid_workers,
     )
 
     # ---- NS groups ----
@@ -396,12 +350,6 @@ def main() -> None:
         ns_groups_path=args.ns_groups_json if args.ns_groups_json and os.path.exists(args.ns_groups_json) else None,
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
-        use_amp=args.use_amp,
-        warmup_steps=args.warmup_steps,
-        lr_decay_steps=args.lr_decay_steps,
-        min_lr_factor=args.min_lr_factor,
-        weight_decay=args.weight_decay,
-        ema_decay=args.ema_decay,
     )
 
     trainer.train()
