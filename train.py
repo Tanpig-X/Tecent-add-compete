@@ -18,7 +18,7 @@ from typing import List, Tuple
 
 import torch
 
-from utils import set_seed, EarlyStopping, create_logger
+from utils import set_seed, enable_fast_math, EarlyStopping, create_logger
 from dataset import FeatureSchema, get_pcvr_data, NUM_TIME_BUCKETS
 from model import PCVRHyFormer
 from trainer import PCVRHyFormerRankingTrainer
@@ -213,8 +213,10 @@ def main() -> None:
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
     Path(args.tf_events_dir).mkdir(parents=True, exist_ok=True)
 
-    # Initialize logger and RNG.
+    # Initialize logger and RNG, then enable TF32 + cuDNN benchmark for
+    # higher throughput. Pure performance toggle: model IO unchanged.
     set_seed(args.seed)
+    enable_fast_math()
     create_logger(os.path.join(args.log_dir, 'train.log'))
     logging.info(f"Args: {vars(args)}")
 

@@ -58,6 +58,8 @@ class PCVRHyFormerRankingTrainer:
         ns_groups_path: Optional[str] = None,
         eval_every_n_steps: int = 0,
         train_config: Optional[Dict[str, Any]] = None,
+        use_amp: bool = True,
+        amp_dtype: torch.dtype = torch.bfloat16,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -73,6 +75,16 @@ class PCVRHyFormerRankingTrainer:
         self.ns_groups_path: Optional[str] = ns_groups_path
 
         # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
+        # AdamW uses fused=True on CUDA for a numerically-equivalent but faster
+        # step kernel; falls back to the default implementation if the running
+        # PyTorch build doesn't support it (rare on torch>=2.0).
+        def _build_adamw(params):
+            adamw_kwargs = dict(lr=lr, betas=(0.9, 0.98))
+            try:
+                return torch.optim.AdamW(params, fused=True, **adamw_kwargs)
+            except (RuntimeError, TypeError):
+                return torch.optim.AdamW(params, **adamw_kwargs)
+
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
         if hasattr(model, 'get_sparse_params'):
             sparse_params = model.get_sparse_params()
@@ -84,14 +96,10 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer = torch.optim.Adagrad(
                 sparse_params, lr=sparse_lr, weight_decay=sparse_weight_decay
             )
-            self.dense_optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-                dense_params, lr=lr, betas=(0.9, 0.98)
-            )
+            self.dense_optimizer: torch.optim.Optimizer = _build_adamw(dense_params)
         else:
             self.sparse_optimizer = None
-            self.dense_optimizer = torch.optim.AdamW(
-                model.parameters(), lr=lr, betas=(0.9, 0.98)
-            )
+            self.dense_optimizer = _build_adamw(model.parameters())
 
         self.num_epochs: int = num_epochs
         self.device: str = device
@@ -108,9 +116,17 @@ class PCVRHyFormerRankingTrainer:
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
 
+        # BF16 autocast: on H20 / H100 this is roughly a 1.5-2x training
+        # speed-up vs FP32 with no GradScaler needed and no change to the
+        # model structure or its inputs/outputs (the autocast region is
+        # entirely inside _train_step / _evaluate_step).
+        self.use_amp: bool = bool(use_amp and device.startswith('cuda'))
+        self.amp_dtype: torch.dtype = amp_dtype
+
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
-                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}")
+                     f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
+                     f"use_amp={self.use_amp} (dtype={self.amp_dtype})")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -409,13 +425,13 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer.zero_grad()
 
         model_input = self._make_model_input(device_batch)
-        logits = self.model(model_input)  # (B, 1)
-        logits = logits.squeeze(-1)  # (B,)
-
-        if self.loss_type == 'focal':
-            loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
-        else:
-            loss = F.binary_cross_entropy_with_logits(logits, label)
+        with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+            logits = self.model(model_input)  # (B, 1)
+            logits = logits.squeeze(-1)  # (B,)
+            if self.loss_type == 'focal':
+                loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
+            else:
+                loss = F.binary_cross_entropy_with_logits(logits, label)
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
@@ -488,7 +504,8 @@ class PCVRHyFormerRankingTrainer:
         label = device_batch['label']
 
         model_input = self._make_model_input(device_batch)
-        logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
-        logits = logits.squeeze(-1)  # (B,)
-
-        return logits, label
+        with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
+            logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
+            logits = logits.squeeze(-1)  # (B,)
+        # Cast back to fp32 so downstream sklearn / sigmoid stays in fp32.
+        return logits.float(), label

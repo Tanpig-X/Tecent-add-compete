@@ -442,6 +442,38 @@ class PCVRParquetDataset(IterableDataset):
         else:
             logging.info(msg)
 
+    @staticmethod
+    def _scatter_varlen(
+        offsets: "npt.NDArray[np.int64]",
+        values: "npt.NDArray[Any]",
+        max_len: int,
+        B: int,
+        out: "npt.NDArray[Any]",
+    ) -> "npt.NDArray[np.int64]":
+        """Vectorised replacement for the per-row pad loop.
+
+        Writes ``values[offsets[i] : offsets[i] + use_len]`` into
+        ``out[i, :use_len]`` for every row ``i``, where
+        ``use_len = min(offsets[i+1] - offsets[i], max_len)``.
+
+        Output is bitwise identical to the original Python loop; only the
+        execution path changes (numpy ``repeat`` + ``cumsum`` instead of B
+        Python iterations). Roughly an order of magnitude faster for typical
+        batch sizes and ten+ feature columns.
+
+        Returns the per-row use_lens vector (shape ``[B]``).
+        """
+        raw_lens = (offsets[1:B + 1] - offsets[:B]).astype(np.int64, copy=False)
+        use_lens = np.minimum(raw_lens, max_len)
+        total = int(use_lens.sum())
+        if total > 0:
+            row_ids = np.repeat(np.arange(B, dtype=np.int64), use_lens)
+            row_starts = np.cumsum(use_lens) - use_lens
+            within_row = np.arange(total, dtype=np.int64) - np.repeat(row_starts, use_lens)
+            src_ids = np.repeat(offsets[:B].astype(np.int64, copy=False), use_lens) + within_row
+            out[row_ids, within_row] = values[src_ids]
+        return use_lens
+
     def _pad_varlen_int_column(
         self,
         arrow_col: "pa.ListArray",
@@ -459,21 +491,10 @@ class PCVRParquetDataset(IterableDataset):
         """
         offsets = arrow_col.offsets.to_numpy()
         values = arrow_col.values.to_numpy()
-
         padded = np.zeros((B, max_len), dtype=np.int64)
-        lengths = np.zeros(B, dtype=np.int64)
-
-        for i in range(B):
-            start, end = int(offsets[i]), int(offsets[i + 1])
-            raw_len = end - start
-            if raw_len <= 0:
-                continue
-            use_len = min(raw_len, max_len)
-            padded[i, :use_len] = values[start:start + use_len]
-            lengths[i] = use_len
-
+        use_lens = self._scatter_varlen(offsets, values, max_len, B, padded)
         padded[padded <= 0] = 0
-        return padded, lengths
+        return padded, use_lens
 
     # Backwards-compatible alias kept for bench_raw_dataset.py and other
     # external callers that pre-date the rename. New code should call
@@ -489,17 +510,8 @@ class PCVRParquetDataset(IterableDataset):
         """Pad an Arrow ``ListArray<float>`` to shape ``[B, max_dim]``."""
         offsets = arrow_col.offsets.to_numpy()
         values = arrow_col.values.to_numpy()
-
         padded = np.zeros((B, max_dim), dtype=np.float32)
-
-        for i in range(B):
-            start, end = int(offsets[i]), int(offsets[i + 1])
-            raw_len = end - start
-            if raw_len <= 0:
-                continue
-            use_len = min(raw_len, max_dim)
-            padded[i, :use_len] = values[start:start + use_len]
-
+        self._scatter_varlen(offsets, values, max_dim, B, padded)
         return padded
 
     def _convert_batch(self, batch: "pa.RecordBatch") -> Dict[str, Any]:
@@ -599,17 +611,12 @@ class PCVRParquetDataset(IterableDataset):
                 col = batch.column(ci)
                 col_data.append((col.offsets.to_numpy(), col.values.to_numpy(), vs, ci))
 
+            # Vectorised scatter per side-info column; lengths is the per-row
+            # max use_len across columns. Output is bitwise identical to the
+            # original Python loop, just routed through numpy.
             for c, (offs, vals, vs, ci) in enumerate(col_data):
-                for i in range(B):
-                    s = int(offs[i])
-                    e = int(offs[i + 1])
-                    rl = e - s
-                    if rl <= 0:
-                        continue
-                    ul = min(rl, max_len)
-                    out[i, c, :ul] = vals[s:s + ul]
-                    if ul > lengths[i]:
-                        lengths[i] = ul
+                use_lens = self._scatter_varlen(offs, vals, max_len, B, out[:, c, :])
+                np.maximum(lengths, use_lens, out=lengths)
 
             # Values <= 0 -> 0.
             out[out <= 0] = 0
@@ -634,16 +641,9 @@ class PCVRParquetDataset(IterableDataset):
                 ts_col = batch.column(ts_ci)
                 ts_offs = ts_col.offsets.to_numpy()
                 ts_vals = ts_col.values.to_numpy()
-                # Pad timestamps into shape (B, max_len).
+                # Pad timestamps into shape (B, max_len) via the same vectorised scatter.
                 ts_padded = np.zeros((B, max_len), dtype=np.int64)
-                for i in range(B):
-                    s = int(ts_offs[i])
-                    e = int(ts_offs[i + 1])
-                    rl = e - s
-                    if rl <= 0:
-                        continue
-                    ul = min(rl, max_len)
-                    ts_padded[i, :ul] = ts_vals[s:s + ul]
+                self._scatter_varlen(ts_offs, ts_vals, max_len, B, ts_padded)
 
                 ts_expanded = timestamps.reshape(-1, 1)
                 time_diff = np.maximum(ts_expanded - ts_padded, 0)
