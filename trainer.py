@@ -75,16 +75,11 @@ class PCVRHyFormerRankingTrainer:
         self.ns_groups_path: Optional[str] = ns_groups_path
 
         # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
-        # AdamW uses fused=True on CUDA for a numerically-equivalent but faster
-        # step kernel; falls back to the default implementation if the running
-        # PyTorch build doesn't support it (rare on torch>=2.0).
-        def _build_adamw(params):
-            adamw_kwargs = dict(lr=lr, betas=(0.9, 0.98))
-            try:
-                return torch.optim.AdamW(params, fused=True, **adamw_kwargs)
-            except (RuntimeError, TypeError):
-                return torch.optim.AdamW(params, **adamw_kwargs)
-
+        # NOTE: do NOT pass fused=True. With ~380 dense tensors of mixed
+        # shapes, fused AdamW can degrade to per-tensor execution (~380
+        # kernel launches), which is *slower* than the default `foreach`
+        # implementation (one kernel per dtype/device group, ~10-20 launches).
+        # See pytorch/pytorch#97149.
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
         if hasattr(model, 'get_sparse_params'):
             sparse_params = model.get_sparse_params()
@@ -96,10 +91,14 @@ class PCVRHyFormerRankingTrainer:
             self.sparse_optimizer = torch.optim.Adagrad(
                 sparse_params, lr=sparse_lr, weight_decay=sparse_weight_decay
             )
-            self.dense_optimizer: torch.optim.Optimizer = _build_adamw(dense_params)
+            self.dense_optimizer: torch.optim.Optimizer = torch.optim.AdamW(
+                dense_params, lr=lr, betas=(0.9, 0.98),
+            )
         else:
             self.sparse_optimizer = None
-            self.dense_optimizer = _build_adamw(model.parameters())
+            self.dense_optimizer = torch.optim.AdamW(
+                model.parameters(), lr=lr, betas=(0.9, 0.98),
+            )
 
         self.num_epochs: int = num_epochs
         self.device: str = device
