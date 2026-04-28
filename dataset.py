@@ -735,7 +735,11 @@ def get_pcvr_data(
     _train_kw = {}
     if num_workers > 0:
         _train_kw['persistent_workers'] = True
-        _train_kw['prefetch_factor'] = 2
+        # prefetch_factor 4 keeps roughly 4*num_workers batches in flight per
+        # worker, hiding I/O latency behind GPU compute. Default is 2 which
+        # leaves the GPU briefly stalled on each batch when forward time
+        # roughly matches per-worker batch-prep time.
+        _train_kw['prefetch_factor'] = 4
 
     train_loader = DataLoader(
         train_dataset, batch_size=None,
@@ -752,12 +756,23 @@ def get_pcvr_data(
         row_group_range=(n_train_rgs, total_rgs),
         clip_vocab=clip_vocab,
     )
+    # Validation used to run with num_workers=0 (single-threaded data prep);
+    # on a 200M-row training set the validation slice is still tens of
+    # millions of rows, so single-threaded prep added several minutes per
+    # eval. Use min(num_workers, 4) workers — same data, same order, just
+    # parallel batch prep — and keep the workers alive across eval calls.
+    _valid_workers = min(num_workers, 4)
+    _valid_kw = {}
+    if _valid_workers > 0:
+        _valid_kw['persistent_workers'] = True
+        _valid_kw['prefetch_factor'] = 4
     valid_loader = DataLoader(
         valid_dataset, batch_size=None,
-        num_workers=0, pin_memory=use_cuda,
+        num_workers=_valid_workers, pin_memory=use_cuda, **_valid_kw,
     )
 
     logging.info(f"Parquet train: {train_rows} rows, valid: {valid_rows} rows, "
-                 f"batch_size={batch_size}, buffer_batches={buffer_batches}")
+                 f"batch_size={batch_size}, buffer_batches={buffer_batches}, "
+                 f"valid_num_workers={_valid_workers}, prefetch_factor=4")
 
     return train_loader, valid_loader, train_dataset
