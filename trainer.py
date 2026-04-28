@@ -75,11 +75,6 @@ class PCVRHyFormerRankingTrainer:
         self.ns_groups_path: Optional[str] = ns_groups_path
 
         # Dual optimizer: Adagrad for sparse Embeddings, AdamW for dense params.
-        # NOTE: do NOT pass fused=True. With ~380 dense tensors of mixed
-        # shapes, fused AdamW can degrade to per-tensor execution (~380
-        # kernel launches), which is *slower* than the default `foreach`
-        # implementation (one kernel per dtype/device group, ~10-20 launches).
-        # See pytorch/pytorch#97149.
         self.sparse_optimizer: Optional[torch.optim.Optimizer]
         if hasattr(model, 'get_sparse_params'):
             sparse_params = model.get_sparse_params()
@@ -92,12 +87,12 @@ class PCVRHyFormerRankingTrainer:
                 sparse_params, lr=sparse_lr, weight_decay=sparse_weight_decay
             )
             self.dense_optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-                dense_params, lr=lr, betas=(0.9, 0.98),
+                dense_params, lr=lr, betas=(0.9, 0.98)
             )
         else:
             self.sparse_optimizer = None
             self.dense_optimizer = torch.optim.AdamW(
-                model.parameters(), lr=lr, betas=(0.9, 0.98),
+                model.parameters(), lr=lr, betas=(0.9, 0.98)
             )
 
         self.num_epochs: int = num_epochs
@@ -114,11 +109,8 @@ class PCVRHyFormerRankingTrainer:
         self.ckpt_params: Dict[str, Any] = ckpt_params or {}
         self.eval_every_n_steps: int = eval_every_n_steps
         self.train_config: Optional[Dict[str, Any]] = train_config
-
-        # BF16 autocast: on H20 / H100 this is roughly a 1.5-2x training
-        # speed-up vs FP32 with no GradScaler needed and no change to the
-        # model structure or its inputs/outputs (the autocast region is
-        # entirely inside _train_step / _evaluate_step).
+        # BF16 autocast: no GradScaler needed, safe with embeddings + LayerNorm
+        # backbone. Disabled automatically on CPU.
         self.use_amp: bool = bool(use_amp and device.startswith('cuda'))
         self.amp_dtype: torch.dtype = amp_dtype
 
@@ -506,5 +498,5 @@ class PCVRHyFormerRankingTrainer:
         with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
             logits, _ = self.model.predict(model_input)  # (B, 1), (B, D)
             logits = logits.squeeze(-1)  # (B,)
-        # Cast back to fp32 so downstream sklearn / sigmoid stays in fp32.
+        # Cast back to float32 so downstream sklearn / sigmoid stays in fp32.
         return logits.float(), label
