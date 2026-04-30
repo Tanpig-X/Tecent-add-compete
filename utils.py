@@ -293,3 +293,38 @@ def sigmoid_focal_loss(
     elif reduction == 'sum':
         return loss.sum()
     return loss
+
+
+def pairwise_bpr_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """In-batch Bayesian Personalised Ranking (BPR) loss.
+
+    For every (positive, negative) pair within the batch we encourage
+    score(pos) > score(neg) by minimising -log sigmoid(pos - neg).
+    This directly optimises the same metric AUC measures (correctly
+    ordered positive/negative pairs), at the cost of losing absolute
+    probability calibration of the BCE/focal head.
+
+    With this dataset's ~12% positive rate and batch_size=256, a typical
+    batch yields ~32 positives × ~224 negatives = 7168 contrast pairs,
+    a much denser ranking signal than pointwise BCE's 256 comparisons.
+
+    Args:
+        logits: (N,) raw logits before sigmoid.
+        targets: (N,) binary labels {0, 1}.
+
+    Returns:
+        Scalar loss. When the batch has only positives or only negatives
+        (no contrast pairs), returns 0 — the caller's BCE/focal head
+        keeps providing gradient.
+    """
+    pos_mask = targets > 0.5
+    neg_mask = ~pos_mask
+    if not bool(pos_mask.any()) or not bool(neg_mask.any()):
+        return logits.new_zeros(())
+    pos_logits = logits[pos_mask]                             # (P,)
+    neg_logits = logits[neg_mask]                             # (N,)
+    diff = pos_logits.unsqueeze(1) - neg_logits.unsqueeze(0)  # (P, N)
+    return -F.logsigmoid(diff).mean()

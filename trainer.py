@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 
-from utils import sigmoid_focal_loss, EarlyStopping
+from utils import sigmoid_focal_loss, pairwise_bpr_loss, EarlyStopping
 from model import ModelInput
 
 
@@ -60,6 +60,7 @@ class PCVRHyFormerRankingTrainer:
         train_config: Optional[Dict[str, Any]] = None,
         use_amp: bool = True,
         amp_dtype: torch.dtype = torch.bfloat16,
+        bpr_weight: float = 0.0,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -114,10 +115,16 @@ class PCVRHyFormerRankingTrainer:
         self.use_amp: bool = bool(use_amp and device.startswith('cuda'))
         self.amp_dtype: torch.dtype = amp_dtype
 
+        # Optional in-batch pairwise BPR ranking loss added on top of the
+        # base BCE / focal head. 0 disables (default), so the change is
+        # backward compatible. Typical starting point: 0.5.
+        self.bpr_weight: float = float(bpr_weight)
+
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
-                     f"use_amp={self.use_amp} (dtype={self.amp_dtype})")
+                     f"use_amp={self.use_amp} (dtype={self.amp_dtype}), "
+                     f"bpr_weight={self.bpr_weight}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -423,6 +430,11 @@ class PCVRHyFormerRankingTrainer:
                 loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
             else:
                 loss = F.binary_cross_entropy_with_logits(logits, label)
+            # Optional: add in-batch pairwise BPR ranking loss to directly
+            # optimise AUC (BCE/focal alone are pointwise; AUC is pairwise).
+            # bpr_weight=0 (default) is a no-op, fully backward compatible.
+            if self.bpr_weight > 0.0:
+                loss = loss + self.bpr_weight * pairwise_bpr_loss(logits, label)
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.

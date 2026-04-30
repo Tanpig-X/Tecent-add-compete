@@ -80,6 +80,13 @@ def parse_args() -> argparse.Namespace:
                         help='Disable BF16 autocast')
     parser.add_argument('--deterministic', action='store_true', default=False,
                         help='Force cuDNN deterministic (slower but reproducible)')
+    parser.add_argument('--bpr_weight', type=float, default=0.0,
+                        help='Weight of an additional in-batch pairwise BPR '
+                             'ranking loss added on top of the BCE/focal head. '
+                             '0 = disabled (default, BCE-only). Typical value: '
+                             '0.5. BPR directly optimises AUC by pushing every '
+                             'positive logit above every negative logit in the '
+                             'same batch.')
     parser.add_argument('--buffer_batches', type=int, default=20,
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
@@ -396,6 +403,7 @@ def main() -> None:
         eval_every_n_steps=args.eval_every_n_steps,
         train_config=vars(args),
         use_amp=args.use_amp,
+        bpr_weight=args.bpr_weight,
     )
 
     trainer.train()
