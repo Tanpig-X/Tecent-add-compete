@@ -1091,10 +1091,20 @@ class GroupNSTokenizer(nn.Module):
                             dslice = dense_feats[:, doff:doff + use_len]  # (B, use_len)
                             if use_len < length:
                                 dslice = F.pad(dslice, (0, length - use_len))
-                            # |dense| as positive per-position weight; +eps on
-                            # valid positions so that an all-zero dense row
-                            # degenerates gracefully back to mean-pool.
-                            weight = dslice.abs() * mask_2d + 1e-6 * mask_2d
+                            # log1p(|dense|) as positive per-position weight.
+                            # Raw |dense| spans many orders of magnitude across
+                            # paired fids (fid 62-66: ~[50, 4e6], fid 89-91:
+                            # ~[0, 1]); using it directly causes the largest
+                            # value in a row to dominate the weighted pool
+                            # (effectively maxpool by weight) AND triggers BF16
+                            # precision collapse when summing values that
+                            # differ by 10^4+. log1p compresses the dynamic
+                            # range to <20 even for 10^7 inputs, restoring a
+                            # well-behaved weighted mean and BF16 numerics.
+                            # A small per-valid-position residual ensures that
+                            # an all-zero dense row falls back to mean pool.
+                            weight = torch.log1p(dslice.abs()) * mask_2d
+                            weight = weight + 1e-3 * mask_2d
                             weight_sum = weight.sum(dim=1, keepdim=True).clamp(min=1e-6)
                             fid_emb = (emb_all * weight.unsqueeze(-1)).sum(dim=1) / weight_sum
                         else:
@@ -1242,7 +1252,12 @@ class RankMixerNSTokenizer(nn.Module):
                             dslice = dense_feats[:, doff:doff + use_len]
                             if use_len < length:
                                 dslice = F.pad(dslice, (0, length - use_len))
-                            weight = dslice.abs() * mask_2d + 1e-6 * mask_2d
+                            # log1p compresses the multi-order-of-magnitude
+                            # spread of |dense| into a stable BF16 range and
+                            # avoids one position dominating the weighted pool.
+                            # See GroupNSTokenizer.forward for full rationale.
+                            weight = torch.log1p(dslice.abs()) * mask_2d
+                            weight = weight + 1e-3 * mask_2d
                             weight_sum = weight.sum(dim=1, keepdim=True).clamp(min=1e-6)
                             fid_emb = (emb_all * weight.unsqueeze(-1)).sum(dim=1) / weight_sum
                         else:
