@@ -6,6 +6,16 @@ __pycache__/
 # Local data + auto-generated schema
 data/
 taac_data/schema.json
+# Exception: keep data/split_1000/schema.json under version control so other
+# devs don't have to regenerate it locally. The (large) parquet shards in
+# the same dir are still ignored.
+# git rule: a file under an ignored directory can only be re-included if
+# every parent on the path is also re-included first.
+!data/
+data/*
+!data/split_1000/
+data/split_1000/*
+!data/split_1000/schema.json
 
 # Training outputs
 ckpt/
