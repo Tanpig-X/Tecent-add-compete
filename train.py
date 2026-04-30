@@ -301,11 +301,28 @@ def main() -> None:
     item_int_feature_specs = build_feature_specs(
         pcvr_dataset.item_int_schema, pcvr_dataset.item_int_vocab_sizes)
 
+    # Dense pairing: fids parallel to *_int_feature_specs and the
+    # corresponding dense (offset, length) for fids that ALSO appear on the
+    # dense side. The model's NS tokenizer uses these to switch from
+    # mean-pool to |dense|-weighted pool on multi-value paired fids.
+    user_int_fids = [fid for fid, _, _ in pcvr_dataset.user_int_schema.entries]
+    item_int_fids = [fid for fid, _, _ in pcvr_dataset.item_int_schema.entries]
+    user_dense_feature_specs = list(pcvr_dataset.user_dense_schema.entries)  # (fid, off, len)
+    item_dense_feature_specs = list(pcvr_dataset.item_dense_schema.entries)
+    n_paired_user = len({f for f, _, _ in user_dense_feature_specs} & set(user_int_fids))
+    n_paired_item = len({f for f, _, _ in item_dense_feature_specs} & set(item_int_fids))
+    logging.info(f"Dense pairing: {n_paired_user} user-side paired fids, "
+                 f"{n_paired_item} item-side paired fids")
+
     model_args = {
         "user_int_feature_specs": user_int_feature_specs,
         "item_int_feature_specs": item_int_feature_specs,
         "user_dense_dim": pcvr_dataset.user_dense_schema.total_dim,
         "item_dense_dim": pcvr_dataset.item_dense_schema.total_dim,
+        "user_int_fids": user_int_fids,
+        "item_int_fids": item_int_fids,
+        "user_dense_feature_specs": user_dense_feature_specs,
+        "item_dense_feature_specs": item_dense_feature_specs,
         "seq_vocab_sizes": pcvr_dataset.seq_domain_vocab_sizes,
         "user_ns_groups": user_ns_groups,
         "item_ns_groups": item_ns_groups,

@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, NamedTuple, Tuple, Optional, Union
+from typing import Dict, List, NamedTuple, Tuple, Optional, Union
 
 
 class ModelInput(NamedTuple):
@@ -995,7 +995,9 @@ class GroupNSTokenizer(nn.Module):
 
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
                  groups: List[List[int]], emb_dim: int, d_model: int,
-                 emb_skip_threshold: int = 0) -> None:
+                 emb_skip_threshold: int = 0,
+                 int_fids: Optional[List[int]] = None,
+                 dense_fid_to_slice: Optional[Dict[int, Tuple[int, int]]] = None) -> None:
         super().__init__()
         self.feature_specs = feature_specs
         self.groups = groups
@@ -1022,6 +1024,20 @@ class GroupNSTokenizer(nn.Module):
             else:
                 self._emb_index.append(-1)
 
+        # Optional dense pairing: for fids that appear in BOTH user_int_feats
+        # and user_dense_feats, the per-row int list and float list are
+        # element-wise paired (same length per row). When the caller supplies
+        # both `int_fids` (parallel to feature_specs) and `dense_fid_to_slice`
+        # (fid → (dense_offset, dense_length) in user_dense_feats), we pre-build
+        # a feature_specs-index → dense slice map so forward() can swap the
+        # default mean-pool for an |dense|-weighted pool on those fids.
+        # Non-paired fids and the length==1 path are unaffected.
+        self._dense_slice_for_idx: Dict[int, Tuple[int, int]] = {}
+        if int_fids is not None and dense_fid_to_slice:
+            for i, fid in enumerate(int_fids):
+                if fid in dense_fid_to_slice:
+                    self._dense_slice_for_idx[i] = dense_fid_to_slice[fid]
+
         # Per-group projection: num_fids_in_group * emb_dim -> d_model (with LayerNorm)
         self.group_projs = nn.ModuleList([
             nn.Sequential(
@@ -1031,11 +1047,17 @@ class GroupNSTokenizer(nn.Module):
             for group in groups
         ])
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(self, int_feats: torch.Tensor,
+                dense_feats: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Embeds and projects grouped discrete features into NS tokens.
 
         Args:
             int_feats: (B, total_int_dim), concatenated integer features.
+            dense_feats: Optional (B, total_dense_dim) tensor; when provided,
+                multi-value fids that have a paired entry in
+                ``self._dense_slice_for_idx`` use ``|dense|``-weighted pooling
+                instead of plain mean pooling. None ⇒ original mean-pool path
+                everywhere (full backward compatibility).
 
         Returns:
             Tokens of shape (B, num_groups, D).
@@ -1055,12 +1077,29 @@ class GroupNSTokenizer(nn.Module):
                         # Single-value feature: direct lookup
                         fid_emb = emb_layer(int_feats[:, offset].long())  # (B, emb_dim)
                     else:
-                        # Multi-value feature: lookup then mean pooling (ignoring padding=0)
+                        # Multi-value feature: lookup then pooling (ignoring padding=0)
                         vals = int_feats[:, offset:offset + length].long()  # (B, length)
                         emb_all = emb_layer(vals)  # (B, length, emb_dim)
-                        mask = (vals != 0).float().unsqueeze(-1)  # (B, length, 1)
-                        count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
+                        mask_2d = (vals != 0).float()  # (B, length)
+                        mask = mask_2d.unsqueeze(-1)   # (B, length, 1)
+
+                        dense_slice_info = (self._dense_slice_for_idx.get(fid_idx)
+                                            if dense_feats is not None else None)
+                        if dense_slice_info is not None:
+                            doff, dlen = dense_slice_info
+                            use_len = min(length, dlen)
+                            dslice = dense_feats[:, doff:doff + use_len]  # (B, use_len)
+                            if use_len < length:
+                                dslice = F.pad(dslice, (0, length - use_len))
+                            # |dense| as positive per-position weight; +eps on
+                            # valid positions so that an all-zero dense row
+                            # degenerates gracefully back to mean-pool.
+                            weight = dslice.abs() * mask_2d + 1e-6 * mask_2d
+                            weight_sum = weight.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                            fid_emb = (emb_all * weight.unsqueeze(-1)).sum(dim=1) / weight_sum
+                        else:
+                            count = mask.sum(dim=1).clamp(min=1)  # (B, 1)
+                            fid_emb = (emb_all * mask).sum(dim=1) / count  # (B, emb_dim)
                 fid_embs.append(fid_emb)
             cat_emb = torch.cat(fid_embs, dim=-1)  # (B, num_fids*emb_dim)
             tokens.append(F.silu(proj(cat_emb)).unsqueeze(1))  # (B, 1, D)
@@ -1083,6 +1122,8 @@ class RankMixerNSTokenizer(nn.Module):
         d_model: int,
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
+        int_fids: Optional[List[int]] = None,
+        dense_fid_to_slice: Optional[Dict[int, Tuple[int, int]]] = None,
     ) -> None:
         """Initializes RankMixerNSTokenizer.
 
@@ -1093,6 +1134,14 @@ class RankMixerNSTokenizer(nn.Module):
             d_model: Output token dimension.
             num_ns_tokens: Number of NS tokens to produce (T segments).
             emb_skip_threshold: Skip embedding for features with vocab > threshold.
+            int_fids: Optional list of fids parallel to feature_specs (i-th entry
+                is the fid of feature_specs[i]). Required only when
+                dense_fid_to_slice is provided.
+            dense_fid_to_slice: Optional mapping fid → (dense_offset,
+                dense_length) into the user_dense_feats tensor. When provided
+                together with int_fids, multi-value fids appearing in BOTH int
+                and dense use ``|dense|``-weighted pooling instead of mean
+                pooling. Non-paired fids are unaffected.
         """
         super().__init__()
         self.feature_specs = feature_specs
@@ -1121,6 +1170,13 @@ class RankMixerNSTokenizer(nn.Module):
             else:
                 self._emb_index.append(-1)
 
+        # Optional dense pairing (see GroupNSTokenizer for the rationale).
+        self._dense_slice_for_idx: Dict[int, Tuple[int, int]] = {}
+        if int_fids is not None and dense_fid_to_slice:
+            for i, fid in enumerate(int_fids):
+                if fid in dense_fid_to_slice:
+                    self._dense_slice_for_idx[i] = dense_fid_to_slice[fid]
+
         # Compute total embedding dim: sum of all fids across all groups
         total_num_fids = sum(len(g) for g in groups)
         total_emb_dim = total_num_fids * emb_dim
@@ -1145,11 +1201,17 @@ class RankMixerNSTokenizer(nn.Module):
             f"num_ns_tokens={num_ns_tokens}, pad={self._pad_size}"
         )
 
-    def forward(self, int_feats: torch.Tensor) -> torch.Tensor:
+    def forward(self, int_feats: torch.Tensor,
+                dense_feats: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Embeds all features, concatenates, splits, and projects.
 
         Args:
             int_feats: (B, total_int_dim) concatenated integer features.
+            dense_feats: Optional (B, total_dense_dim); when provided AND the
+                tokenizer was constructed with int_fids + dense_fid_to_slice,
+                multi-value fids paired with a dense slice use
+                ``|dense|``-weighted pooling instead of mean pool. Otherwise
+                falls through to the original mean-pool path.
 
         Returns:
             (B, num_ns_tokens, d_model) tensor.
@@ -1169,9 +1231,23 @@ class RankMixerNSTokenizer(nn.Module):
                     else:
                         vals = int_feats[:, offset:offset + length].long()
                         emb_all = emb_layer(vals)
-                        mask = (vals != 0).float().unsqueeze(-1)
-                        count = mask.sum(dim=1).clamp(min=1)
-                        fid_emb = (emb_all * mask).sum(dim=1) / count
+                        mask_2d = (vals != 0).float()
+                        mask = mask_2d.unsqueeze(-1)
+
+                        dense_slice_info = (self._dense_slice_for_idx.get(fid_idx)
+                                            if dense_feats is not None else None)
+                        if dense_slice_info is not None:
+                            doff, dlen = dense_slice_info
+                            use_len = min(length, dlen)
+                            dslice = dense_feats[:, doff:doff + use_len]
+                            if use_len < length:
+                                dslice = F.pad(dslice, (0, length - use_len))
+                            weight = dslice.abs() * mask_2d + 1e-6 * mask_2d
+                            weight_sum = weight.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                            fid_emb = (emb_all * weight.unsqueeze(-1)).sum(dim=1) / weight_sum
+                        else:
+                            count = mask.sum(dim=1).clamp(min=1)
+                            fid_emb = (emb_all * mask).sum(dim=1) / count
                 all_embs.append(fid_emb)
 
         cat_emb = torch.cat(all_embs, dim=-1)  # (B, total_emb_dim)
@@ -1229,6 +1305,14 @@ class PCVRHyFormer(nn.Module):
         ns_tokenizer_type: str = 'rankmixer',
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
+        # Optional: dense pairing — fids that appear in both int and dense
+        # sides with element-wise paired list values. When provided, the user
+        # NS tokenizer pools paired-fid embeddings weighted by |dense_value|
+        # instead of uniform mean. External ModelInput is unchanged.
+        user_int_fids: Optional[List[int]] = None,
+        user_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
+        item_int_fids: Optional[List[int]] = None,
+        item_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
     ) -> None:
         super().__init__()
 
@@ -1247,6 +1331,20 @@ class PCVRHyFormer(nn.Module):
 
         # ================== NS Tokens Construction ==================
 
+        # Build fid → (dense_offset, dense_length) maps from the optional
+        # *_dense_feature_specs arguments. These are used by the NS tokenizers
+        # to pool embeddings of multi-value paired fids by |dense| weight.
+        user_dense_fid_to_slice: Dict[int, Tuple[int, int]] = {
+            fid: (off, ln) for fid, off, ln in (user_dense_feature_specs or [])
+        }
+        item_dense_fid_to_slice: Dict[int, Tuple[int, int]] = {
+            fid: (off, ln) for fid, off, ln in (item_dense_feature_specs or [])
+        }
+        # Cache so forward() knows whether to forward dense_feats into the
+        # tokenizers at all.
+        self._user_has_dense_pairing = bool(user_dense_fid_to_slice and user_int_fids)
+        self._item_has_dense_pairing = bool(item_dense_fid_to_slice and item_int_fids)
+
         if ns_tokenizer_type == 'group':
             # Original: one NS token per group
             self.user_ns_tokenizer = GroupNSTokenizer(
@@ -1255,6 +1353,8 @@ class PCVRHyFormer(nn.Module):
                 emb_dim=emb_dim,
                 d_model=d_model,
                 emb_skip_threshold=emb_skip_threshold,
+                int_fids=user_int_fids,
+                dense_fid_to_slice=user_dense_fid_to_slice,
             )
             num_user_ns = len(user_ns_groups)
 
@@ -1264,6 +1364,8 @@ class PCVRHyFormer(nn.Module):
                 emb_dim=emb_dim,
                 d_model=d_model,
                 emb_skip_threshold=emb_skip_threshold,
+                int_fids=item_int_fids,
+                dense_fid_to_slice=item_dense_fid_to_slice,
             )
             num_item_ns = len(item_ns_groups)
         elif ns_tokenizer_type == 'rankmixer':
@@ -1280,6 +1382,8 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=user_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                int_fids=user_int_fids,
+                dense_fid_to_slice=user_dense_fid_to_slice,
             )
             num_user_ns = user_ns_tokens
 
@@ -1290,6 +1394,8 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
                 num_ns_tokens=item_ns_tokens,
                 emb_skip_threshold=emb_skip_threshold,
+                int_fids=item_int_fids,
+                dense_fid_to_slice=item_dense_fid_to_slice,
             )
             num_item_ns = item_ns_tokens
         else:
@@ -1634,8 +1740,14 @@ class PCVRHyFormer(nn.Module):
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)   # (B, num_user_groups, D)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)   # (B, num_item_groups, D)
+        # Pass dense_feats only when this tokenizer was constructed with a
+        # dense pairing map; otherwise None preserves the mean-pool path.
+        user_dense_for_pair = (inputs.user_dense_feats
+                               if self._user_has_dense_pairing else None)
+        item_dense_for_pair = (inputs.item_dense_feats
+                               if self._item_has_dense_pairing else None)
+        user_ns = self.user_ns_tokenizer(inputs.user_int_feats, user_dense_for_pair)   # (B, num_user_groups, D)
+        item_ns = self.item_ns_tokenizer(inputs.item_int_feats, item_dense_for_pair)   # (B, num_item_groups, D)
 
         ns_parts = [user_ns]
         if self.has_user_dense:
@@ -1677,8 +1789,12 @@ class PCVRHyFormer(nn.Module):
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""
         # Reuses forward logic but without dropout
-        user_ns = self.user_ns_tokenizer(inputs.user_int_feats)
-        item_ns = self.item_ns_tokenizer(inputs.item_int_feats)
+        user_dense_for_pair = (inputs.user_dense_feats
+                               if self._user_has_dense_pairing else None)
+        item_dense_for_pair = (inputs.item_dense_feats
+                               if self._item_has_dense_pairing else None)
+        user_ns = self.user_ns_tokenizer(inputs.user_int_feats, user_dense_for_pair)
+        item_ns = self.item_ns_tokenizer(inputs.item_int_feats, item_dense_for_pair)
 
         ns_parts = [user_ns]
         if self.has_user_dense:
