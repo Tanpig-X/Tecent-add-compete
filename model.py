@@ -128,6 +128,7 @@ class RoPEMultiheadAttention(nn.Module):
         num_heads: int,
         dropout: float = 0.0,
         rope_on_q: bool = True,
+        enable_time_bias: bool = False,
     ) -> None:
         super().__init__()
         self.d_model = d_model
@@ -147,6 +148,52 @@ class RoPEMultiheadAttention(nn.Module):
         nn.init.zeros_(self.W_g.weight)
         nn.init.constant_(self.W_g.bias, 1.0)
 
+        # Optional time-aware attention bias (TIN-style).
+        # alpha_h init=0 makes the bias a no-op at start, so a trained-without-
+        # bias ckpt + this code path produces *identical* logits — fully
+        # backward compatible. The model decides during training whether to
+        # use the bias (alpha grows away from 0) or not (alpha stays ~0).
+        self.enable_time_bias = enable_time_bias
+        if enable_time_bias:
+            self.time_bias_alpha = nn.Parameter(torch.zeros(num_heads))
+        else:
+            self.time_bias_alpha = None
+
+    def _build_time_bias(
+        self,
+        time_bucket_q: Optional[torch.Tensor],
+        time_bucket_k: Optional[torch.Tensor],
+        B: int, Lq: int, Lk: int,
+        device: torch.device, dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """Build per-head time-aware additive bias of shape (B, num_heads, Lq, Lk).
+
+        Two modes:
+        * Self-attention (both Q and K have time buckets): bias =
+          -alpha_h * |bucket_q - bucket_k|, penalising temporally-distant
+          attention pairs.
+        * Cross-attention (only K has time buckets, Q tokens are abstract
+          "interest" queries with no natural time): treat Q as "current"
+          (bucket=0), so bias = -alpha_h * bucket_k. This pushes Q to attend
+          to recent seq tokens.
+
+        bucket=0 marks padding; we don't special-case it here because the
+        existing key_padding_mask -> -inf already wipes those positions.
+        """
+        if not self.enable_time_bias or time_bucket_k is None:
+            return None
+        bk = time_bucket_k.to(dtype).clamp(min=0)                       # (B, Lk)
+        if time_bucket_q is None:
+            # cross-attn: per-key bias, broadcast across all Q rows
+            diff = bk.unsqueeze(1).expand(B, Lq, Lk)                    # (B, Lq, Lk)
+        else:
+            bq = time_bucket_q.to(dtype).clamp(min=0)                   # (B, Lq)
+            diff = (bq.unsqueeze(-1) - bk.unsqueeze(-2)).abs()          # (B, Lq, Lk)
+        # alpha_h: (num_heads,) → (1, num_heads, 1, 1)
+        alpha = self.time_bias_alpha.to(dtype).view(1, -1, 1, 1)
+        bias = -alpha * diff.unsqueeze(1)                               # (B, num_heads, Lq, Lk)
+        return bias
+
     def forward(
         self,
         query: torch.Tensor,
@@ -159,6 +206,8 @@ class RoPEMultiheadAttention(nn.Module):
         q_rope_cos: Optional[torch.Tensor] = None,
         q_rope_sin: Optional[torch.Tensor] = None,
         need_weights: bool = False,
+        time_bucket_q: Optional[torch.Tensor] = None,
+        time_bucket_k: Optional[torch.Tensor] = None,
     ) -> tuple:
         """Computes multi-head attention with optional RoPE.
 
@@ -203,25 +252,40 @@ class RoPEMultiheadAttention(nn.Module):
                 q_sin = q_rope_sin if q_rope_sin is not None else rope_sin
                 Q = apply_rope_to_tensor(Q, q_cos, q_sin)
 
-        # 4. Convert key_padding_mask to SDPA format
+        # 4. Compute optional time-aware additive bias (TIN-style).
+        time_bias = self._build_time_bias(
+            time_bucket_q, time_bucket_k, B, Lq, Lk,
+            device=Q.device, dtype=Q.dtype,
+        )
+
+        # 5. Convert key_padding_mask to SDPA format. When time_bias is
+        # present we MUST use a float additive mask (not bool) so the bias
+        # can be added; otherwise we keep the original bool mask path for
+        # exact backward compatibility.
         sdpa_attn_mask = None
-        if key_padding_mask is not None:
-            # key_padding_mask: (B, Lk), True = padding
-            # SDPA expects (B, 1, 1, Lk) bool mask, True = attend
-            sdpa_attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Lk)
-            sdpa_attn_mask = sdpa_attn_mask.expand(B, self.num_heads, Lq, Lk)
+        if time_bias is None:
+            if key_padding_mask is not None:
+                sdpa_attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Lk)
+                sdpa_attn_mask = sdpa_attn_mask.expand(B, self.num_heads, Lq, Lk)
+            if attn_mask is not None:
+                bool_attn = (attn_mask == 0)
+                bool_attn = bool_attn.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, Lq, Lk)
+                if sdpa_attn_mask is not None:
+                    sdpa_attn_mask = sdpa_attn_mask & bool_attn
+                else:
+                    sdpa_attn_mask = bool_attn
+        else:
+            # Float-mask path: combine padding (-inf) and time bias additively
+            float_mask = time_bias                                    # (B, H, Lq, Lk)
+            if key_padding_mask is not None:
+                pad_bias = key_padding_mask.to(Q.dtype).unsqueeze(1).unsqueeze(2) * -1e9
+                float_mask = float_mask + pad_bias                    # broadcast to (B, H, Lq, Lk)
+            if attn_mask is not None:
+                # additive attn_mask broadcast over batch + heads
+                float_mask = float_mask + attn_mask.unsqueeze(0).unsqueeze(0)
+            sdpa_attn_mask = float_mask
 
-        if attn_mask is not None:
-            # attn_mask: additive float mask (Lq, Lk), -inf means do not attend
-            # Convert to bool: positions that are not -inf are True
-            bool_attn = (attn_mask == 0)  # (Lq, Lk)
-            bool_attn = bool_attn.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, Lq, Lk)
-            if sdpa_attn_mask is not None:
-                sdpa_attn_mask = sdpa_attn_mask & bool_attn
-            else:
-                sdpa_attn_mask = bool_attn
-
-        # 5. Scaled Dot-Product Attention
+        # 6. Scaled Dot-Product Attention
         dropout_p = self.dropout if self.training else 0.0
         out = F.scaled_dot_product_attention(
             Q, K, V,
@@ -253,7 +317,8 @@ class CrossAttention(nn.Module):
         d_model: int,
         num_heads: int,
         dropout: float = 0.0,
-        ln_mode: str = 'pre'
+        ln_mode: str = 'pre',
+        enable_time_bias: bool = False,
     ) -> None:
         super().__init__()
         self.ln_mode = ln_mode
@@ -263,6 +328,7 @@ class CrossAttention(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             rope_on_q=False,
+            enable_time_bias=enable_time_bias,
         )
 
         if ln_mode in ['pre', 'post']:
@@ -276,6 +342,7 @@ class CrossAttention(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
+        time_bucket_kv: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Computes cross-attention between query tokens and sequence tokens.
 
@@ -285,6 +352,10 @@ class CrossAttention(nn.Module):
             key_padding_mask: (B, L), True indicates padding positions.
             rope_cos: (1, L, head_dim), KV-side RoPE cosine values.
             rope_sin: (1, L, head_dim), KV-side RoPE sine values.
+            time_bucket_kv: (B, L), per-key time bucket id. When provided
+                together with enable_time_bias=True in the underlying
+                attention, Q is treated as "current" and the bias becomes
+                -alpha * bucket_kv per key (recency favouring).
 
         Returns:
             Output tensor of shape (B, Nq, D).
@@ -302,6 +373,8 @@ class CrossAttention(nn.Module):
             key_padding_mask=key_padding_mask,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
+            time_bucket_q=None,            # Q has no natural time
+            time_bucket_k=time_bucket_kv,
         )
 
         out = residual + out
@@ -552,7 +625,8 @@ class TransformerEncoder(nn.Module):
         d_model: int,
         num_heads: int,
         hidden_mult: int = 4,
-        dropout: float = 0.0
+        dropout: float = 0.0,
+        enable_time_bias: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
@@ -563,6 +637,7 @@ class TransformerEncoder(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             rope_on_q=True,
+            enable_time_bias=enable_time_bias,
         )
 
         hidden_dim = d_model * hidden_mult
@@ -580,6 +655,7 @@ class TransformerEncoder(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         rope_cos: Optional[torch.Tensor] = None,
         rope_sin: Optional[torch.Tensor] = None,
+        time_bucket: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies one Transformer encoder layer.
 
@@ -588,6 +664,9 @@ class TransformerEncoder(nn.Module):
             key_padding_mask: (B, L), True indicates padding positions.
             rope_cos: (1, L, head_dim), RoPE cosine values.
             rope_sin: (1, L, head_dim), RoPE sine values.
+            time_bucket: (B, L), per-token time bucket id (1..num_buckets,
+                0=padding). Used by self-attn for TIN-style additive bias
+                when enable_time_bias=True; ignored otherwise.
 
         Returns:
             Tuple of (output tensor of shape (B, L, D), key_padding_mask).
@@ -602,6 +681,8 @@ class TransformerEncoder(nn.Module):
             key_padding_mask=key_padding_mask,
             rope_cos=rope_cos,
             rope_sin=rope_sin,
+            time_bucket_q=time_bucket,
+            time_bucket_k=time_bucket,
         )
         x = residual + x
 
@@ -815,7 +896,8 @@ def create_sequence_encoder(
     hidden_mult: int = 4,
     dropout: float = 0.0,
     top_k: int = 50,
-    causal: bool = False
+    causal: bool = False,
+    enable_time_bias: bool = False,
 ) -> nn.Module:
     """Creates a sequence encoder of the specified type.
 
@@ -828,6 +910,8 @@ def create_sequence_encoder(
         top_k: Compression length for LongerEncoder (only used by longer).
         causal: Whether to use causal mask in LongerEncoder (only used by
             longer).
+        enable_time_bias: Forward to TransformerEncoder for TIN-style
+            time-aware self-attention bias. Ignored by other encoder types.
 
     Returns:
         A sequence encoder module.
@@ -835,7 +919,8 @@ def create_sequence_encoder(
     if encoder_type == 'swiglu':
         return SwiGLUEncoder(d_model, hidden_mult, dropout)
     elif encoder_type == 'transformer':
-        return TransformerEncoder(d_model, num_heads, hidden_mult, dropout)
+        return TransformerEncoder(d_model, num_heads, hidden_mult, dropout,
+                                  enable_time_bias=enable_time_bias)
     elif encoder_type == 'longer':
         return LongerEncoder(d_model, num_heads, top_k, hidden_mult, dropout, causal)
     else:
@@ -867,7 +952,8 @@ class MultiSeqHyFormerBlock(nn.Module):
         dropout: float = 0.0,
         top_k: int = 50,
         causal: bool = False,
-        rank_mixer_mode: str = 'full'
+        rank_mixer_mode: str = 'full',
+        enable_time_bias: bool = False,
     ) -> None:
         super().__init__()
         self.num_sequences = num_sequences
@@ -883,7 +969,8 @@ class MultiSeqHyFormerBlock(nn.Module):
                 hidden_mult=hidden_mult,
                 dropout=dropout,
                 top_k=top_k,
-                causal=causal
+                causal=causal,
+                enable_time_bias=enable_time_bias,
             )
             for _ in range(num_sequences)
         ])
@@ -894,7 +981,8 @@ class MultiSeqHyFormerBlock(nn.Module):
                 d_model=d_model,
                 num_heads=num_heads,
                 dropout=dropout,
-                ln_mode='pre'
+                ln_mode='pre',
+                enable_time_bias=enable_time_bias,
             )
             for _ in range(num_sequences)
         ])
@@ -917,6 +1005,7 @@ class MultiSeqHyFormerBlock(nn.Module):
         seq_padding_masks: list,
         rope_cos_list: Optional[List[torch.Tensor]] = None,
         rope_sin_list: Optional[List[torch.Tensor]] = None,
+        time_bucket_list: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[list, torch.Tensor, list, list]:
         """Processes one multi-sequence HyFormer block step.
 
@@ -927,6 +1016,11 @@ class MultiSeqHyFormerBlock(nn.Module):
             seq_padding_masks: List of (B, L_i) masks, length S.
             rope_cos_list: List of (1, L_i, head_dim) tensors, length S.
             rope_sin_list: List of (1, L_i, head_dim) tensors, length S.
+            time_bucket_list: List of (B, L_i) per-token time bucket ids.
+                When provided AND the underlying attention modules were
+                constructed with enable_time_bias=True, the seq self-attn
+                gets a TIN-style pairwise bias and the Q-cross-attn gets a
+                per-key recency bias. None ⇒ original mean/uniform path.
 
         Returns:
             A tuple (next_q_list, next_ns, next_seq_list, next_masks), where
@@ -944,9 +1038,14 @@ class MultiSeqHyFormerBlock(nn.Module):
         for i in range(S):
             rc = rope_cos_list[i] if rope_cos_list is not None else None
             rs = rope_sin_list[i] if rope_sin_list is not None else None
+            tb = time_bucket_list[i] if time_bucket_list is not None else None
+            # Pass time_bucket only to TransformerEncoder which understands it.
+            kwargs = dict(rope_cos=rc, rope_sin=rs)
+            if tb is not None and isinstance(self.seq_encoders[i], TransformerEncoder):
+                kwargs['time_bucket'] = tb
             result = self.seq_encoders[i](
                 seq_tokens_list[i], seq_padding_masks[i],
-                rope_cos=rc, rope_sin=rs,
+                **kwargs,
             )
             next_seq_i, mask_i = result
             next_seqs.append(next_seq_i)
@@ -957,9 +1056,13 @@ class MultiSeqHyFormerBlock(nn.Module):
         for i in range(S):
             rc = rope_cos_list[i] if rope_cos_list is not None else None
             rs = rope_sin_list[i] if rope_sin_list is not None else None
+            tb = time_bucket_list[i] if time_bucket_list is not None else None
+            kwargs = dict(rope_cos=rc, rope_sin=rs)
+            if tb is not None:
+                kwargs['time_bucket_kv'] = tb
             decoded_q_i = self.cross_attns[i](
                 q_tokens_list[i], next_seqs[i], next_masks[i],
-                rope_cos=rc, rope_sin=rs,
+                **kwargs,
             )
             decoded_qs.append(decoded_q_i)
 
@@ -1328,6 +1431,11 @@ class PCVRHyFormer(nn.Module):
         user_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
         item_int_fids: Optional[List[int]] = None,
         item_dense_feature_specs: Optional[List[Tuple[int, int, int]]] = None,
+        # TIN-style time-aware attention bias. When True, every Transformer
+        # encoder + cross-attention in the backbone gets a per-head learnable
+        # alpha (init=0) that scales an additive bias derived from the seq
+        # token time bucket ids. alpha=0 reproduces the baseline exactly.
+        time_attn_bias: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1341,6 +1449,7 @@ class PCVRHyFormer(nn.Module):
         self.rank_mixer_mode = rank_mixer_mode
         self.use_rope = use_rope
         self.emb_skip_threshold = emb_skip_threshold
+        self.time_attn_bias = time_attn_bias
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
 
@@ -1522,6 +1631,7 @@ class PCVRHyFormer(nn.Module):
                 top_k=seq_top_k,
                 causal=seq_causal,
                 rank_mixer_mode=rank_mixer_mode,
+                enable_time_bias=time_attn_bias,
             )
             for _ in range(num_hyformer_blocks)
         ])
@@ -1708,7 +1818,8 @@ class PCVRHyFormer(nn.Module):
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
         seq_masks_list: list,
-        apply_dropout: bool = True
+        apply_dropout: bool = True,
+        time_bucket_list: Optional[List[torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Runs the multi-sequence block stack with dropout and output projection."""
         if apply_dropout:
@@ -1742,6 +1853,7 @@ class PCVRHyFormer(nn.Module):
                 seq_padding_masks=curr_masks,
                 rope_cos_list=rope_cos_list,
                 rope_sin_list=rope_sin_list,
+                time_bucket_list=time_bucket_list,
             )
 
         # Output: concatenate all sequences' Q tokens then project via MLP
@@ -1792,9 +1904,18 @@ class PCVRHyFormer(nn.Module):
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
+        # Pass time_bucket only when this model was constructed with the
+        # TIN-style attention bias enabled; otherwise None preserves the
+        # exact baseline path (alpha=0 anyway, but skipping the float-mask
+        # branch saves a few ops).
+        time_bucket_list = (
+            [inputs.seq_time_buckets[d] for d in self.seq_domains]
+            if self.time_attn_bias else None
+        )
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=self.training
+            apply_dropout=self.training,
+            time_bucket_list=time_bucket_list,
         )
 
         # 5. Classifier
@@ -1836,9 +1957,14 @@ class PCVRHyFormer(nn.Module):
 
         q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
 
+        time_bucket_list = (
+            [inputs.seq_time_buckets[d] for d in self.seq_domains]
+            if self.time_attn_bias else None
+        )
         output = self._run_multi_seq_blocks(
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
-            apply_dropout=False
+            apply_dropout=False,
+            time_bucket_list=time_bucket_list,
         )
 
         logits = self.clsfier(output)

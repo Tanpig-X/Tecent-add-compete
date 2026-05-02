@@ -47,7 +47,11 @@ export TRAIN_TF_EVENTS_PATH="${TRAIN_TF_EVENTS_PATH:-${SCRIPT_DIR}/tb}"
 
 # ---- Alternative config: RankMixer NS tokenizer (no ns_groups.json required) ----
 # --bpr_weight 0.5: in-batch pairwise BPR loss added on top of BCE. Directly
-# optimises AUC's pairwise ordering metric. Set to 0 to disable.
+#                  optimises AUC's pairwise ordering metric. Set to 0 to disable.
+# --time_attn_bias: TIN-style time-aware attention bias on backbone self-attn
+#                  + cross-attn. Per-head learnable alpha (init=0, equivalent to
+#                  baseline at start). Forces recency-favouring on cross-attn
+#                  and pairwise-time-distance penalty on seq self-attn.
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
@@ -58,4 +62,5 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --batch_size 8 \
     --num_workers 4 \
     --bpr_weight 0.5 \
+    --time_attn_bias \
     "$@"

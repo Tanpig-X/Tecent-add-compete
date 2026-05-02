@@ -149,6 +149,14 @@ def parse_args() -> argparse.Namespace:
                         help='Enable RoPE positional encoding in sequence attention')
     parser.add_argument('--rope_base', type=float, default=10000.0,
                         help='RoPE base frequency (default 10000)')
+    parser.add_argument('--time_attn_bias', action='store_true', default=False,
+                        help='Enable TIN-style time-aware additive bias on '
+                             'every Transformer self-attn and Q-cross-attn '
+                             'inside the backbone. Adds a per-head learnable '
+                             'alpha (init=0, so equivalent to baseline at '
+                             'start). When enabled, the seq self-attn gets '
+                             '-alpha*|bucket_q-bucket_k| and the cross-attn '
+                             'gets -alpha*bucket_k (recency favouring).')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -353,6 +361,7 @@ def main() -> None:
         "ns_tokenizer_type": args.ns_tokenizer_type,
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
+        "time_attn_bias": args.time_attn_bias,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
