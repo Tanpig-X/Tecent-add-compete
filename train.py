@@ -157,6 +157,21 @@ def parse_args() -> argparse.Namespace:
                              'start). When enabled, the seq self-attn gets '
                              '-alpha*|bucket_q-bucket_k| and the cross-attn '
                              'gets -alpha*bucket_k (recency favouring).')
+    # ---- DIN (target attention over user item-id history) ----
+    parser.add_argument('--din_enabled', action='store_true', default=False,
+                        help='Enable DIN-style target attention. Hashes '
+                             'item_id into a fixed vocab and uses the same '
+                             'embedding for the target item AND the user '
+                             'history items, then runs target-aware MLP '
+                             'attention. Output is added as one extra NS token.')
+    parser.add_argument('--din_hash_size', type=int, default=1_000_000,
+                        help='Hash bucket count for the DIN item_id embedding. '
+                             '1M ≈ 64 MB at emb_dim=64.')
+    parser.add_argument('--din_history_domain', type=str, default='seq_c',
+                        help='Which seq domain holds the user item-id history.')
+    parser.add_argument('--din_history_fid', type=int, default=47,
+                        help='Which fid inside --din_history_domain is the '
+                             'item_id history column.')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -362,9 +377,30 @@ def main() -> None:
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
         "time_attn_bias": args.time_attn_bias,
+        "din_enabled": args.din_enabled,
+        "din_hash_size": args.din_hash_size,
+        "din_history_domain": args.din_history_domain,
+        "din_history_fid": args.din_history_fid,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
+
+    # Resolve DIN history fid → its position in seq_data[domain]'s second axis.
+    # dataset.py packs seq_data along sideinfo_fids order (excluding ts_fid),
+    # so we look up din_history_fid inside that list.
+    if args.din_enabled:
+        sideinfo_fids = pcvr_dataset.sideinfo_fids[args.din_history_domain]
+        if args.din_history_fid not in sideinfo_fids:
+            raise ValueError(
+                f"--din_history_fid={args.din_history_fid} not found in "
+                f"sideinfo fids of --din_history_domain={args.din_history_domain}: "
+                f"{sideinfo_fids}"
+            )
+        fid_idx = sideinfo_fids.index(args.din_history_fid)
+        model.set_din_history_fid_idx(fid_idx)
+        logging.info(f"DIN history: domain={args.din_history_domain}, "
+                     f"fid={args.din_history_fid}, fid_idx={fid_idx}, "
+                     f"hash_size={args.din_hash_size}")
 
     # Log model sizing info.
     num_sequences = len(pcvr_dataset.seq_domains)

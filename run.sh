@@ -52,9 +52,14 @@ export TRAIN_TF_EVENTS_PATH="${TRAIN_TF_EVENTS_PATH:-${SCRIPT_DIR}/tb}"
 #                  + cross-attn. Per-head learnable alpha (init=0, equivalent to
 #                  baseline at start). Forces recency-favouring on cross-attn
 #                  and pairwise-time-distance penalty on seq self-attn.
+# --din_enabled:   DIN target attention. Hash-embeds item_id (default 1M
+#                  buckets) and uses the same emb for target item AND user
+#                  item-id history (seq_c[fid=47]). Output added as 1 NS token.
+#                  Critical because that history's vocab is ~3.34e8 — too big
+#                  for a regular embedding (otherwise zeroed by emb_skip).
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 5 \
+    --user_ns_tokens 4 \
     --item_ns_tokens 2 \
     --num_queries 2 \
     --ns_groups_json "" \
@@ -63,4 +68,13 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --num_workers 4 \
     --bpr_weight 0.5 \
     --time_attn_bias \
+    --din_enabled \
+    --din_hash_size 1000000 \
+    --din_history_domain seq_c \
+    --din_history_fid 47 \
     "$@"
+# Note on T constraint with DIN:
+#   T = num_queries*num_seq + num_ns = 2*4 + (4 user + 1 user_dense + 2 item + 1 DIN) = 16
+#   d_model=64 % T(16) = 0  ✓
+# Without DIN, the previous config used user_ns_tokens=5; opening DIN adds
+# 1 more NS token, so we drop user_ns_tokens by 1 to keep T=16 divisible.

@@ -403,6 +403,14 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets[domain] = device_batch.get(
                 f'{domain}_time_bucket',
                 torch.zeros(B, L, dtype=torch.long, device=self.device))
+        # item_id is optional in the dataset (older batches may not include it).
+        # Default to a zero tensor with the right shape so DIN-disabled models
+        # don't trip on a missing field, and DIN-enabled models still get a
+        # valid placeholder when running against legacy data.
+        item_id = device_batch.get('item_id')
+        if item_id is None:
+            B = device_batch['user_int_feats'].shape[0]
+            item_id = torch.zeros(B, dtype=torch.long, device=self.device)
         return ModelInput(
             user_int_feats=device_batch['user_int_feats'],
             item_int_feats=device_batch['item_int_feats'],
@@ -411,6 +419,7 @@ class PCVRHyFormerRankingTrainer:
             seq_data=seq_data,
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
+            item_id=item_id,
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:

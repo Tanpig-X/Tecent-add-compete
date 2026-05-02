@@ -16,6 +16,80 @@ class ModelInput(NamedTuple):
     seq_data: dict        # {domain: tensor [B, S, L]}
     seq_lens: dict        # {domain: tensor [B]}
     seq_time_buckets: dict  # {domain: tensor [B, L]}
+    # Optional: target item_id (B,). Required by DIN module; an all-zero
+    # placeholder is fine when DIN is disabled.
+    item_id: Optional[torch.Tensor] = None
+
+
+class DINModule(nn.Module):
+    """Deep Interest Network (DIN) target attention.
+
+    Given the target item_id and a sequence of user-historical item_ids,
+    produces a target-aware aggregate of the history. The aggregate is
+    projected to d_model and emitted as a single NS token.
+
+    Both the target and the history go through the *same* hash embedding
+    table — we hash item_id into a fixed-size vocab (default 1M) so the
+    table stays at a tractable size even when the raw item_id space is
+    hundreds of millions (the seq_c[fid=47] vocab is ~3.34e8). This is
+    the standard CTR trick for handling open-vocab id features without
+    blowing up GPU memory.
+
+    Architecture:
+        target_emb  = item_id_emb(hash(target_id))           (B, D)
+        history_emb = item_id_emb(hash(history_ids))         (B, L, D)
+        feat        = cat(target, hist, target * hist)       (B, L, 3D)
+        score       = MLP(feat)                              (B, L)
+        weight      = softmax(score, mask padding)           (B, L)
+        attended    = sum(weight * history_emb)              (B, D)
+        ns_token    = SiLU(LayerNorm(Linear(attended)))      (B, 1, d_model)
+    """
+
+    def __init__(self, hash_size: int, emb_dim: int, d_model: int) -> None:
+        super().__init__()
+        self.hash_size = int(hash_size)
+        # +1 so id 0 stays as a dedicated padding row (padding_idx=0).
+        self.item_id_emb = nn.Embedding(self.hash_size + 1, emb_dim, padding_idx=0)
+        # Attention scoring MLP over [target, history, target*history]
+        self.attn_mlp = nn.Sequential(
+            nn.Linear(3 * emb_dim, emb_dim),
+            nn.SiLU(),
+            nn.Linear(emb_dim, 1),
+        )
+        # Project the attended d-dim vector to d_model and gate as an NS token
+        self.out_proj = nn.Sequential(
+            nn.Linear(emb_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def _hash(self, ids: torch.Tensor) -> torch.Tensor:
+        """Modulo hash, preserving 0 as the padding bucket."""
+        # Use absolute value first so negative ids (padding sentinel = -1)
+        # collapse to 0 cleanly.
+        clean = ids.clamp(min=0).long()
+        hashed = clean % self.hash_size + 1               # [1, hash_size]
+        return torch.where(clean > 0, hashed, clean)      # 0 stays 0
+
+    def forward(
+        self,
+        target_id: torch.Tensor,         # (B,)
+        history_ids: torch.Tensor,        # (B, L)
+        history_valid_mask: torch.Tensor, # (B, L), True = valid token
+    ) -> torch.Tensor:                    # (B, 1, d_model)
+        target_hashed = self._hash(target_id)            # (B,)
+        history_hashed = self._hash(history_ids)          # (B, L)
+        target_emb = self.item_id_emb(target_hashed)      # (B, D)
+        history_emb = self.item_id_emb(history_hashed)    # (B, L, D)
+
+        B, L, D = history_emb.shape
+        target_exp = target_emb.unsqueeze(1).expand(B, L, D)
+        feat = torch.cat([target_exp, history_emb,
+                          target_exp * history_emb], dim=-1)        # (B, L, 3D)
+        scores = self.attn_mlp(feat).squeeze(-1)                     # (B, L)
+        scores = scores.masked_fill(~history_valid_mask, -1e9)
+        weights = F.softmax(scores, dim=-1).unsqueeze(-1)            # (B, L, 1)
+        attended = (history_emb * weights).sum(dim=1)                # (B, D)
+        return F.silu(self.out_proj(attended)).unsqueeze(1)          # (B, 1, d_model)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1436,6 +1510,15 @@ class PCVRHyFormer(nn.Module):
         # alpha (init=0) that scales an additive bias derived from the seq
         # token time bucket ids. alpha=0 reproduces the baseline exactly.
         time_attn_bias: bool = False,
+        # DIN target attention. When True, builds a hash-embedding lookup for
+        # item_id and runs a target-aware attention over the user's item-id
+        # history (a specific seq domain + fid combo). Output is added as one
+        # extra NS token. Required because the seq_c[fid=47] (= item_id history)
+        # vocab is ~3.34e8 and is otherwise zeroed out by emb_skip_threshold.
+        din_enabled: bool = False,
+        din_hash_size: int = 1_000_000,
+        din_history_domain: str = 'seq_c',
+        din_history_fid: int = 47,
     ) -> None:
         super().__init__()
 
@@ -1541,9 +1624,28 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        # ================== DIN target attention ==================
+        # When enabled, looks up the index of `din_history_fid` inside the
+        # `din_history_domain`'s sideinfo_fids list (passed via seq_vocab_sizes
+        # — but the per-fid order isn't directly accessible here, so we keep
+        # din_history_fid_idx unresolved and let forward() compute it lazily
+        # from the seq_data slice; we store the user's fid spec for runtime).
+        self.din_enabled = din_enabled
+        if din_enabled:
+            self.din_history_domain = din_history_domain
+            self.din_history_fid = din_history_fid
+            # The index of din_history_fid within seq_data[din_history_domain]'s
+            # second axis (the "S" axis = sideinfo_fids order). Filled in
+            # set_din_history_fid_idx() after dataset is constructed.
+            self._din_history_fid_idx: Optional[int] = None
+            self.din_module = DINModule(
+                hash_size=din_hash_size, emb_dim=emb_dim, d_model=d_model,
+            )
+
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
-                       + num_item_ns + (1 if self.has_item_dense else 0))
+                       + num_item_ns + (1 if self.has_item_dense else 0)
+                       + (1 if din_enabled else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -1864,6 +1966,29 @@ class PCVRHyFormer(nn.Module):
 
         return output
 
+    def _compute_din_token(self, inputs: ModelInput) -> torch.Tensor:
+        """Look up target item_id + history item_ids → DIN attention → 1 NS token."""
+        history_seq = inputs.seq_data[self.din_history_domain]   # (B, S, L)
+        if self._din_history_fid_idx is None:
+            raise RuntimeError(
+                "DIN enabled but _din_history_fid_idx is not resolved. "
+                "Call model.set_din_history_fid_idx(idx) after construction "
+                "or set it from train.py once the dataset is available."
+            )
+        history_ids = history_seq[:, self._din_history_fid_idx, :]    # (B, L)
+        history_lens = inputs.seq_lens[self.din_history_domain]
+        history_padding_mask = self._make_padding_mask(
+            history_lens, history_ids.shape[1])                       # True = padding
+        valid_mask = ~history_padding_mask                            # True = valid
+        return self.din_module(inputs.item_id, history_ids, valid_mask)  # (B, 1, d_model)
+
+    def set_din_history_fid_idx(self, fid_idx: int) -> None:
+        """After PCVRHyFormer is constructed, train.py resolves din_history_fid
+        to its index inside the seq_data[din_history_domain]'s sideinfo_fids
+        order (which is what dataset.py packs into the second axis of the
+        seq tensor) and registers it here."""
+        self._din_history_fid_idx = int(fid_idx)
+
     def forward(self, inputs: ModelInput) -> torch.Tensor:
         """Runs the forward pass of the PCVRHyFormer model."""
         # 1. NS tokens: grouped projection
@@ -1884,6 +2009,8 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
+        if self.din_enabled:
+            ns_parts.append(self._compute_din_token(inputs))         # (B, 1, D)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -1940,6 +2067,8 @@ class PCVRHyFormer(nn.Module):
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
+        if self.din_enabled:
+            ns_parts.append(self._compute_din_token(inputs))
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 
