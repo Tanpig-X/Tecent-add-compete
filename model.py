@@ -22,6 +22,11 @@ class ModelInput(NamedTuple):
     # Optional: per-token inter-event time bucket (gap to next-older
     # neighbour) per domain. None or empty dict ⇒ feature disabled.
     seq_inter_buckets: Optional[dict] = None
+    # Optional: per-token periodic time bucket — hour-of-day (1..24, 0
+    # padding) and day-of-week (1..7, 0 padding) for each historical
+    # event. None or empty dict ⇒ feature disabled.
+    seq_hour_buckets: Optional[dict] = None
+    seq_weekday_buckets: Optional[dict] = None
 
 
 class DINModule(nn.Module):
@@ -1526,6 +1531,10 @@ class PCVRHyFormer(nn.Module):
         # the same seq, additive embedding similar to time_embedding.
         # Captures burstiness ("3 clicks in 1 minute" vs "3 clicks in a week").
         use_inter_event_features: bool = False,
+        # Per-token periodic time: hour-of-day + day-of-week of each
+        # historical event. Captures circadian patterns INSIDE the seq
+        # (separate from sample-level periodic features in user_int).
+        use_seq_periodic_time: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1725,6 +1734,17 @@ class PCVRHyFormer(nn.Module):
             self.inter_event_embedding = nn.Embedding(
                 num_time_buckets, d_model, padding_idx=0)
 
+        # Per-token periodic time features for seq tokens. Two small
+        # additive embeddings (hour: 25, weekday: 8), shared across all
+        # seq domains. Captures circadian patterns inside the user
+        # behaviour history (different from sample-level periodic features
+        # which are appended to user_int_feats and reflect the time of
+        # the *current* sample).
+        self.use_seq_periodic_time = bool(use_seq_periodic_time)
+        if self.use_seq_periodic_time:
+            self.seq_hour_embedding = nn.Embedding(25, d_model, padding_idx=0)
+            self.seq_weekday_embedding = nn.Embedding(8, d_model, padding_idx=0)
+
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
         self.query_generator = MultiSeqQueryGenerator(
@@ -1899,6 +1919,8 @@ class PCVRHyFormer(nn.Module):
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
         inter_bucket_ids: Optional[torch.Tensor] = None,
+        hour_bucket_ids: Optional[torch.Tensor] = None,
+        weekday_bucket_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1926,6 +1948,13 @@ class PCVRHyFormer(nn.Module):
                 and self.num_time_buckets > 0
                 and inter_bucket_ids is not None):
             token_emb = token_emb + self.inter_event_embedding(inter_bucket_ids)
+
+        # Optional: add per-token periodic time embeddings (hour, weekday).
+        if self.use_seq_periodic_time:
+            if hour_bucket_ids is not None:
+                token_emb = token_emb + self.seq_hour_embedding(hour_bucket_ids)
+            if weekday_bucket_ids is not None:
+                token_emb = token_emb + self.seq_weekday_embedding(weekday_bucket_ids)
 
         return token_emb
 
@@ -2043,12 +2072,18 @@ class PCVRHyFormer(nn.Module):
         for domain in self.seq_domains:
             inter_b = (inputs.seq_inter_buckets.get(domain)
                        if inputs.seq_inter_buckets is not None else None)
+            hour_b = (inputs.seq_hour_buckets.get(domain)
+                      if inputs.seq_hour_buckets is not None else None)
+            wkday_b = (inputs.seq_weekday_buckets.get(domain)
+                       if inputs.seq_weekday_buckets is not None else None)
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain],
-                inter_bucket_ids=inter_b)
+                inter_bucket_ids=inter_b,
+                hour_bucket_ids=hour_b,
+                weekday_bucket_ids=wkday_b)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -2103,12 +2138,18 @@ class PCVRHyFormer(nn.Module):
         for domain in self.seq_domains:
             inter_b = (inputs.seq_inter_buckets.get(domain)
                        if inputs.seq_inter_buckets is not None else None)
+            hour_b = (inputs.seq_hour_buckets.get(domain)
+                      if inputs.seq_hour_buckets is not None else None)
+            wkday_b = (inputs.seq_weekday_buckets.get(domain)
+                       if inputs.seq_weekday_buckets is not None else None)
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
                 inputs.seq_time_buckets[domain],
-                inter_bucket_ids=inter_b)
+                inter_bucket_ids=inter_b,
+                hour_bucket_ids=hour_b,
+                weekday_bucket_ids=wkday_b)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

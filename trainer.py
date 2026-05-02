@@ -399,6 +399,8 @@ class PCVRHyFormerRankingTrainer:
         # add_inter_event_features=True; missing keys → leave dict empty for
         # those domains (model-side falls through to "no inter feature").
         seq_inter_buckets: Dict[str, torch.Tensor] = {}
+        seq_hour_buckets: Dict[str, torch.Tensor] = {}
+        seq_weekday_buckets: Dict[str, torch.Tensor] = {}
         for domain in seq_domains:
             seq_data[domain] = device_batch[domain]
             seq_lens[domain] = device_batch[f'{domain}_len']
@@ -410,6 +412,12 @@ class PCVRHyFormerRankingTrainer:
             inter = device_batch.get(f'{domain}_inter_bucket')
             if inter is not None:
                 seq_inter_buckets[domain] = inter
+            hour = device_batch.get(f'{domain}_seq_hour_bucket')
+            if hour is not None:
+                seq_hour_buckets[domain] = hour
+            wkday = device_batch.get(f'{domain}_seq_weekday_bucket')
+            if wkday is not None:
+                seq_weekday_buckets[domain] = wkday
         # item_id is optional in the dataset (older batches may not include it).
         # Default to a zero tensor with the right shape so DIN-disabled models
         # don't trip on a missing field, and DIN-enabled models still get a
@@ -428,6 +436,8 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets=seq_time_buckets,
             item_id=item_id,
             seq_inter_buckets=(seq_inter_buckets if seq_inter_buckets else None),
+            seq_hour_buckets=(seq_hour_buckets if seq_hour_buckets else None),
+            seq_weekday_buckets=(seq_weekday_buckets if seq_weekday_buckets else None),
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:

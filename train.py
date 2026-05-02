@@ -193,6 +193,14 @@ def parse_args() -> argparse.Namespace:
                              'time_embedding). Captures burstiness signals '
                              'like "10 clicks in 1 minute" vs "10 clicks in '
                              '1 week". Adds ~4 KB params.')
+    parser.add_argument('--use_seq_periodic_time', action='store_true',
+                        default=False,
+                        help='Per-token periodic features for seq history: '
+                             'hour-of-day and day-of-week of EACH historical '
+                             'event (independent of the sample-level periodic '
+                             'features in user_int). Two small additive '
+                             'embeddings shared across all 4 seq domains. '
+                             'Captures circadian/weekly behaviour patterns.')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -331,6 +339,7 @@ def main() -> None:
         add_periodic_time_features=args.add_periodic_time_features,
         timestamp_tz_offset=args.timestamp_tz_offset,
         add_inter_event_features=args.use_inter_event_features,
+        add_seq_periodic_time=args.use_seq_periodic_time,
     )
 
     # ---- NS groups ----
@@ -406,6 +415,7 @@ def main() -> None:
         "din_history_domain": args.din_history_domain,
         "din_history_fid": args.din_history_fid,
         "use_inter_event_features": args.use_inter_event_features,
+        "use_seq_periodic_time": args.use_seq_periodic_time,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

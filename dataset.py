@@ -157,6 +157,7 @@ class PCVRParquetDataset(IterableDataset):
         add_periodic_time_features: bool = False,
         timestamp_tz_offset: int = 0,
         add_inter_event_features: bool = False,
+        add_seq_periodic_time: bool = False,
     ) -> None:
         """
         Args:
@@ -257,6 +258,22 @@ class PCVRParquetDataset(IterableDataset):
                 f"Inter-event time features ON for {doms}; emits "
                 f"{{domain}}_inter_bucket per batch (vocab={NUM_TIME_BUCKETS}, "
                 f"shares the existing BUCKET_BOUNDARIES)."
+            )
+
+        # Per-token periodic time features for each seq domain. Each token
+        # in a seq carries its own timestamp; from it we derive the (hour,
+        # weekday) the historical event happened — useful for capturing
+        # session/circadian patterns ("user clicks comedy videos on Sunday
+        # nights"). Same +1 shift convention as the sample-level periodic
+        # features (0=padding, 1..24 hours, 1..7 weekdays).
+        self.add_seq_periodic_time = bool(add_seq_periodic_time)
+        if self.add_seq_periodic_time:
+            doms = [d for d in self.seq_domains if self.ts_fids[d] is not None]
+            logging.info(
+                f"Seq-token periodic time features ON for {doms}; emits "
+                f"{{domain}}_seq_hour_bucket (vocab=25) and "
+                f"{{domain}}_seq_weekday_bucket (vocab=8) per batch, "
+                f"tz_offset={self.timestamp_tz_offset}s."
             )
 
         # ---- Pre-compute column index lookup ----
@@ -721,6 +738,20 @@ class PCVRParquetDataset(IterableDataset):
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
 
+            # ---- Per-token periodic time features (optional) ----
+            # For each seq token, compute the hour-of-day and day-of-week
+            # the historical event happened. Padding positions (ts == 0)
+            # get bucket=0; valid positions get hour 1..24 and weekday 1..7
+            # (Sun=1..Sat=7 after +1 shift).
+            if self.add_seq_periodic_time and ts_ci is not None:
+                shifted = ts_padded.astype(np.int64) + self.timestamp_tz_offset
+                hour_b = ((shifted % 86400) // 3600 + 1).astype(np.int64)
+                weekday_b = ((shifted // 86400 + 4) % 7 + 1).astype(np.int64)
+                hour_b[ts_padded == 0] = 0
+                weekday_b[ts_padded == 0] = 0
+                result[f'{domain}_seq_hour_bucket'] = torch.from_numpy(hour_b.copy())
+                result[f'{domain}_seq_weekday_bucket'] = torch.from_numpy(weekday_b.copy())
+
             # ---- Inter-event time delta bucket (optional) ----
             # Per-token gap to the next-older neighbour in the same seq.
             # Seq is sorted descending in time (newest at position 0), so
@@ -765,6 +796,7 @@ def get_pcvr_data(
     add_periodic_time_features: bool = False,
     timestamp_tz_offset: int = 0,
     add_inter_event_features: bool = False,
+    add_seq_periodic_time: bool = False,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -863,6 +895,7 @@ def get_pcvr_data(
         add_periodic_time_features=add_periodic_time_features,
         timestamp_tz_offset=timestamp_tz_offset,
         add_inter_event_features=add_inter_event_features,
+        add_seq_periodic_time=add_seq_periodic_time,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -888,6 +921,7 @@ def get_pcvr_data(
         add_periodic_time_features=add_periodic_time_features,
         timestamp_tz_offset=timestamp_tz_offset,
         add_inter_event_features=add_inter_event_features,
+        add_seq_periodic_time=add_seq_periodic_time,
     )
     if valid_num_workers is None:
         valid_num_workers = min(num_workers, 2)
