@@ -395,6 +395,10 @@ class PCVRHyFormerRankingTrainer:
         seq_data: Dict[str, torch.Tensor] = {}
         seq_lens: Dict[str, torch.Tensor] = {}
         seq_time_buckets: Dict[str, torch.Tensor] = {}
+        # inter_bucket only present when dataset was built with
+        # add_inter_event_features=True; missing keys → leave dict empty for
+        # those domains (model-side falls through to "no inter feature").
+        seq_inter_buckets: Dict[str, torch.Tensor] = {}
         for domain in seq_domains:
             seq_data[domain] = device_batch[domain]
             seq_lens[domain] = device_batch[f'{domain}_len']
@@ -403,6 +407,9 @@ class PCVRHyFormerRankingTrainer:
             seq_time_buckets[domain] = device_batch.get(
                 f'{domain}_time_bucket',
                 torch.zeros(B, L, dtype=torch.long, device=self.device))
+            inter = device_batch.get(f'{domain}_inter_bucket')
+            if inter is not None:
+                seq_inter_buckets[domain] = inter
         # item_id is optional in the dataset (older batches may not include it).
         # Default to a zero tensor with the right shape so DIN-disabled models
         # don't trip on a missing field, and DIN-enabled models still get a
@@ -420,6 +427,7 @@ class PCVRHyFormerRankingTrainer:
             seq_lens=seq_lens,
             seq_time_buckets=seq_time_buckets,
             item_id=item_id,
+            seq_inter_buckets=(seq_inter_buckets if seq_inter_buckets else None),
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:

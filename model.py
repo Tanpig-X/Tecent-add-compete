@@ -19,6 +19,9 @@ class ModelInput(NamedTuple):
     # Optional: target item_id (B,). Required by DIN module; an all-zero
     # placeholder is fine when DIN is disabled.
     item_id: Optional[torch.Tensor] = None
+    # Optional: per-token inter-event time bucket (gap to next-older
+    # neighbour) per domain. None or empty dict ⇒ feature disabled.
+    seq_inter_buckets: Optional[dict] = None
 
 
 class DINModule(nn.Module):
@@ -1519,6 +1522,10 @@ class PCVRHyFormer(nn.Module):
         din_hash_size: int = 1_000_000,
         din_history_domain: str = 'seq_c',
         din_history_fid: int = 47,
+        # Inter-event time bucket: per-token gap to next-older neighbour in
+        # the same seq, additive embedding similar to time_embedding.
+        # Captures burstiness ("3 clicks in 1 minute" vs "3 clicks in a week").
+        use_inter_event_features: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1709,6 +1716,15 @@ class PCVRHyFormer(nn.Module):
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
 
+        # Inter-event delta uses the same bucket vocab (NUM_TIME_BUCKETS) as
+        # time_embedding but a SEPARATE table — the two signals encode
+        # different semantics ("how long ago" vs "gap to neighbour"); sharing
+        # a single table would force the model to entangle them.
+        self.use_inter_event_features = bool(use_inter_event_features)
+        if self.use_inter_event_features and num_time_buckets > 0:
+            self.inter_event_embedding = nn.Embedding(
+                num_time_buckets, d_model, padding_idx=0)
+
         # ================== HyFormer Components ==================
         # MultiSeqQueryGenerator
         self.query_generator = MultiSeqQueryGenerator(
@@ -1882,6 +1898,7 @@ class PCVRHyFormer(nn.Module):
         is_id: List[bool],
         emb_index: List[int],
         time_bucket_ids: torch.Tensor,
+        inter_bucket_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Embeds a sequence domain by concatenating sideinfo embeddings and projecting to d_model."""
         B, S, L = seq.shape
@@ -1903,6 +1920,12 @@ class PCVRHyFormer(nn.Module):
         # Add time bucket embedding (all-zero ids produce zero vectors via padding_idx=0)
         if self.num_time_buckets > 0:
             token_emb = token_emb + self.time_embedding(time_bucket_ids)
+
+        # Optional: add inter-event time delta embedding (separate table).
+        if (self.use_inter_event_features
+                and self.num_time_buckets > 0
+                and inter_bucket_ids is not None):
+            token_emb = token_emb + self.inter_event_embedding(inter_bucket_ids)
 
         return token_emb
 
@@ -2018,11 +2041,14 @@ class PCVRHyFormer(nn.Module):
         seq_tokens_list = []
         seq_masks_list = []
         for domain in self.seq_domains:
+            inter_b = (inputs.seq_inter_buckets.get(domain)
+                       if inputs.seq_inter_buckets is not None else None)
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inter_bucket_ids=inter_b)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -2075,11 +2101,14 @@ class PCVRHyFormer(nn.Module):
         seq_tokens_list = []
         seq_masks_list = []
         for domain in self.seq_domains:
+            inter_b = (inputs.seq_inter_buckets.get(domain)
+                       if inputs.seq_inter_buckets is not None else None)
             tokens = self._embed_seq_domain(
                 inputs.seq_data[domain],
                 self._seq_embs[domain], self._seq_proj[domain],
                 self._seq_is_id[domain], self._seq_emb_index[domain],
-                inputs.seq_time_buckets[domain])
+                inputs.seq_time_buckets[domain],
+                inter_bucket_ids=inter_b)
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

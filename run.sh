@@ -74,6 +74,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --din_history_fid 47 \
     --add_periodic_time_features \
     --timestamp_tz_offset 28800 \
+    --use_inter_event_features \
     "$@"
 # Note on T constraint with DIN:
 #   T = num_queries*num_seq + num_ns = 2*4 + (4 user + 1 user_dense + 2 item + 1 DIN) = 16

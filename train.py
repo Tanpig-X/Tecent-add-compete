@@ -185,6 +185,14 @@ def parse_args() -> argparse.Namespace:
                         help='Seconds to add to sample timestamp before '
                              'computing hour/weekday. Use 28800 (=8h) when '
                              'data is in Beijing time, 0 when in UTC.')
+    parser.add_argument('--use_inter_event_features', action='store_true',
+                        default=False,
+                        help='Per-token inter-event time gap (token_i_ts - '
+                             'token_{i+1}_ts) bucketised and additively '
+                             'embedded into seq tokens (separate table from '
+                             'time_embedding). Captures burstiness signals '
+                             'like "10 clicks in 1 minute" vs "10 clicks in '
+                             '1 week". Adds ~4 KB params.')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -322,6 +330,7 @@ def main() -> None:
         valid_num_workers=valid_workers,
         add_periodic_time_features=args.add_periodic_time_features,
         timestamp_tz_offset=args.timestamp_tz_offset,
+        add_inter_event_features=args.use_inter_event_features,
     )
 
     # ---- NS groups ----
@@ -396,6 +405,7 @@ def main() -> None:
         "din_hash_size": args.din_hash_size,
         "din_history_domain": args.din_history_domain,
         "din_history_fid": args.din_history_fid,
+        "use_inter_event_features": args.use_inter_event_features,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

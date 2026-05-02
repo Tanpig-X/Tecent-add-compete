@@ -156,6 +156,7 @@ class PCVRParquetDataset(IterableDataset):
         is_training: bool = True,
         add_periodic_time_features: bool = False,
         timestamp_tz_offset: int = 0,
+        add_inter_event_features: bool = False,
     ) -> None:
         """
         Args:
@@ -241,6 +242,21 @@ class PCVRParquetDataset(IterableDataset):
                 f"{self._periodic_hour_offset} (vocab=25), weekday at offset "
                 f"{self._periodic_weekday_offset} (vocab=8), "
                 f"tz_offset={self.timestamp_tz_offset}s"
+            )
+
+        # Inter-event time delta: per-token gap to the next-older neighbour
+        # within the same seq. Captures "burstiness" (10 events in 3 minutes
+        # vs 10 events in 3 days have different intent). Same bucket
+        # boundaries as the existing time_bucket so the model can reuse the
+        # bucket semantics. Only emits buckets when ts_fid is configured for
+        # the domain (otherwise no time signal to compute deltas from).
+        self.add_inter_event_features = bool(add_inter_event_features)
+        if self.add_inter_event_features:
+            doms = [d for d in self.seq_domains if self.ts_fids[d] is not None]
+            logging.info(
+                f"Inter-event time features ON for {doms}; emits "
+                f"{{domain}}_inter_bucket per batch (vocab={NUM_TIME_BUCKETS}, "
+                f"shares the existing BUCKET_BOUNDARIES)."
             )
 
         # ---- Pre-compute column index lookup ----
@@ -705,6 +721,31 @@ class PCVRParquetDataset(IterableDataset):
 
             result[f'{domain}_time_bucket'] = torch.from_numpy(time_bucket.copy())
 
+            # ---- Inter-event time delta bucket (optional) ----
+            # Per-token gap to the next-older neighbour in the same seq.
+            # Seq is sorted descending in time (newest at position 0), so
+            # delta[i] = ts[i] - ts[i+1] >= 0. The last (oldest) position
+            # has no next-older neighbour → bucket=0 (padding).
+            if self.add_inter_event_features:
+                inter_bucket = np.zeros((B, max_len), dtype=np.int64)
+                if ts_ci is not None:
+                    # Both neighbours must be real (non-padding) for a valid
+                    # delta; otherwise bucket stays 0.
+                    valid_pair = (ts_padded[:, :-1] > 0) & (ts_padded[:, 1:] > 0)
+                    delta = np.where(
+                        valid_pair,
+                        np.maximum(ts_padded[:, :-1] - ts_padded[:, 1:], 0),
+                        0,
+                    )                                                # (B, max_len-1)
+                    raw_inter = np.clip(
+                        np.searchsorted(BUCKET_BOUNDARIES, delta.ravel()),
+                        0, len(BUCKET_BOUNDARIES) - 1,
+                    )
+                    inter_bucket[:, :-1] = (
+                        raw_inter.reshape(B, max_len - 1) + 1
+                    ) * valid_pair.astype(np.int64)
+                result[f'{domain}_inter_bucket'] = torch.from_numpy(inter_bucket)
+
         return result
 
 
@@ -723,6 +764,7 @@ def get_pcvr_data(
     valid_num_workers: Optional[int] = None,
     add_periodic_time_features: bool = False,
     timestamp_tz_offset: int = 0,
+    add_inter_event_features: bool = False,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -820,6 +862,7 @@ def get_pcvr_data(
         clip_vocab=clip_vocab,
         add_periodic_time_features=add_periodic_time_features,
         timestamp_tz_offset=timestamp_tz_offset,
+        add_inter_event_features=add_inter_event_features,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -844,6 +887,7 @@ def get_pcvr_data(
         clip_vocab=clip_vocab,
         add_periodic_time_features=add_periodic_time_features,
         timestamp_tz_offset=timestamp_tz_offset,
+        add_inter_event_features=add_inter_event_features,
     )
     if valid_num_workers is None:
         valid_num_workers = min(num_workers, 2)
