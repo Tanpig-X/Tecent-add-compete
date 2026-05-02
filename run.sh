@@ -59,7 +59,7 @@ export TRAIN_TF_EVENTS_PATH="${TRAIN_TF_EVENTS_PATH:-${SCRIPT_DIR}/tb}"
 #                  for a regular embedding (otherwise zeroed by emb_skip).
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 4 \
+    --user_ns_tokens 3 \
     --item_ns_tokens 2 \
     --num_queries 2 \
     --ns_groups_json "" \
@@ -76,7 +76,14 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --timestamp_tz_offset 28800 \
     --use_inter_event_features \
     --use_seq_periodic_time \
+    --use_time_ns_token \
     "$@"
+# T constraint with all current NS tokens enabled:
+#   T = num_queries*num_seq + num_ns
+#     = 2*4 + (3 user + 1 user_dense + 2 item + 1 DIN + 1 TimeNS) = 16
+#   d_model=64 % 16 = 0 ✓
+# user_ns_tokens dropped from 4 → 3 to make room for the new TimeNS token.
+# If you turn off DIN OR TimeNS, bump user_ns_tokens back up by 1 to keep T=16.
 # Note on T constraint with DIN:
 #   T = num_queries*num_seq + num_ns = 2*4 + (4 user + 1 user_dense + 2 item + 1 DIN) = 16
 #   d_model=64 % T(16) = 0  ✓

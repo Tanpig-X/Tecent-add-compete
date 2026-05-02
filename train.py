@@ -201,6 +201,15 @@ def parse_args() -> argparse.Namespace:
                              'features in user_int). Two small additive '
                              'embeddings shared across all 4 seq domains. '
                              'Captures circadian/weekly behaviour patterns.')
+    parser.add_argument('--use_time_ns_token', action='store_true',
+                        default=False,
+                        help='Aggregate per-domain time-bucket histograms '
+                             'into ONE shared NS token (TimeNSModule). Lets '
+                             'backbone attention attend to time DISTRIBUTION '
+                             'as a separate channel rather than only via the '
+                             'per-token additive time signal. Adds 1 NS token '
+                             '— remember to keep d_model %% T == 0 (e.g. drop '
+                             '--user_ns_tokens by 1 to compensate).')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -416,6 +425,7 @@ def main() -> None:
         "din_history_fid": args.din_history_fid,
         "use_inter_event_features": args.use_inter_event_features,
         "use_seq_periodic_time": args.use_seq_periodic_time,
+        "use_time_ns_token": args.use_time_ns_token,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

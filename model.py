@@ -100,6 +100,65 @@ class DINModule(nn.Module):
         return F.silu(self.out_proj(attended)).unsqueeze(1)          # (B, 1, d_model)
 
 
+class TimeNSModule(nn.Module):
+    """Aggregate per-domain time-bucket histograms into ONE shared NS token.
+
+    Motivation: the existing time signal is injected ADDITIVELY into each
+    seq token (token_emb += time_embedding(bucket)). The information is
+    therefore mixed inside every token's d_model channel; backbone attention
+    has no clean way to attend to the *time distribution* on its own.
+    This module gives time its own NS token by:
+
+      1. For each seq domain compute a histogram over time buckets via
+         scatter_add (counts how many tokens fell into each bucket).
+      2. Padding bucket (0) is masked to 0 so it doesn't add a free
+         "sequence length" bias to every row.
+      3. Concatenate the per-domain histograms and project to d_model.
+
+    The resulting (B, 1, d_model) token joins the rest of ns_parts and the
+    backbone's mixer/cross-attention can attend to it independently of the
+    per-token additive time signal.
+    """
+
+    def __init__(
+        self,
+        num_time_buckets: int,
+        num_seq_domains: int,
+        d_model: int,
+        hidden_mult: int = 2,
+    ) -> None:
+        super().__init__()
+        self.num_time_buckets = int(num_time_buckets)
+        self.num_seq_domains = int(num_seq_domains)
+        in_dim = self.num_time_buckets * self.num_seq_domains
+        self.proj = nn.Sequential(
+            nn.Linear(in_dim, d_model * hidden_mult),
+            nn.SiLU(),
+            nn.Linear(d_model * hidden_mult, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(self, time_buckets_per_domain: List[torch.Tensor]) -> torch.Tensor:
+        """time_buckets_per_domain: list of (B, L_i) tensors (one per domain).
+        Returns (B, 1, d_model)."""
+        hists = []
+        for tb in time_buckets_per_domain:
+            B = tb.shape[0]
+            hist = tb.new_zeros(B, self.num_time_buckets, dtype=torch.float)
+            idx = tb.clamp(min=0, max=self.num_time_buckets - 1).long()
+            hist.scatter_add_(
+                1, idx, torch.ones_like(idx, dtype=torch.float))
+            hist[:, 0] = 0                  # mask the padding bucket count
+            # log1p compresses the count range so the MLP sees a tame
+            # input even when L is large (e.g. 1024 tokens → counts up
+            # to ~1024 collapses to ~7 after log1p).
+            hist = torch.log1p(hist)
+            hists.append(hist)
+        cat_hist = torch.cat(hists, dim=-1)              # (B, num_seq * num_time_buckets)
+        out = self.proj(cat_hist)                        # (B, d_model)
+        return out.unsqueeze(1)                          # (B, 1, d_model)
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Rotary Position Embedding (RoPE)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1535,6 +1594,10 @@ class PCVRHyFormer(nn.Module):
         # historical event. Captures circadian patterns INSIDE the seq
         # (separate from sample-level periodic features in user_int).
         use_seq_periodic_time: bool = False,
+        # Aggregate per-domain time-bucket histograms into one shared NS
+        # token. Lets backbone attention attend to time DISTRIBUTION
+        # explicitly (orthogonal to the per-token additive time signal).
+        use_time_ns_token: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1640,6 +1703,15 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
+        # ================== Time NS token (aggregated histograms) ==================
+        self.use_time_ns_token = bool(use_time_ns_token)
+        if self.use_time_ns_token and num_time_buckets > 0:
+            self.time_ns_module = TimeNSModule(
+                num_time_buckets=num_time_buckets,
+                num_seq_domains=self.num_sequences,
+                d_model=d_model,
+            )
+
         # ================== DIN target attention ==================
         # When enabled, looks up the index of `din_history_fid` inside the
         # `din_history_domain`'s sideinfo_fids list (passed via seq_vocab_sizes
@@ -1661,7 +1733,8 @@ class PCVRHyFormer(nn.Module):
         # Total NS token count
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0)
-                       + (1 if din_enabled else 0))
+                       + (1 if din_enabled else 0)
+                       + (1 if self.use_time_ns_token else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -2063,6 +2136,10 @@ class PCVRHyFormer(nn.Module):
             ns_parts.append(item_dense_tok)
         if self.din_enabled:
             ns_parts.append(self._compute_din_token(inputs))         # (B, 1, D)
+        if self.use_time_ns_token:
+            time_buckets_list = [
+                inputs.seq_time_buckets[d] for d in self.seq_domains]
+            ns_parts.append(self.time_ns_module(time_buckets_list))  # (B, 1, D)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -2130,6 +2207,10 @@ class PCVRHyFormer(nn.Module):
             ns_parts.append(item_dense_tok)
         if self.din_enabled:
             ns_parts.append(self._compute_din_token(inputs))
+        if self.use_time_ns_token:
+            time_buckets_list = [
+                inputs.seq_time_buckets[d] for d in self.seq_domains]
+            ns_parts.append(self.time_ns_module(time_buckets_list))
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 
