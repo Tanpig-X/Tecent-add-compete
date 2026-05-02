@@ -154,6 +154,8 @@ class PCVRParquetDataset(IterableDataset):
         row_group_range: Optional[Tuple[int, int]] = None,
         clip_vocab: bool = True,
         is_training: bool = True,
+        add_periodic_time_features: bool = False,
+        timestamp_tz_offset: int = 0,
     ) -> None:
         """
         Args:
@@ -213,6 +215,33 @@ class PCVRParquetDataset(IterableDataset):
 
         # Load schema.json.
         self._load_schema(schema_path, seq_max_lens or {})
+
+        # Optional: append two synthetic user_int features derived from the
+        # sample timestamp — `hour_of_day` (0-23) and `day_of_week` (0-6,
+        # Sun=0). Both are shifted by +1 so the value 0 stays reserved as
+        # padding and 1..N are the real categories. Doing this here (post
+        # _load_schema, pre buffer allocation) means downstream code sees a
+        # slightly larger user_int_schema with two extra entries — no other
+        # path in the dataset or model needs to know about it.
+        self.add_periodic_time_features = bool(add_periodic_time_features)
+        self.timestamp_tz_offset = int(timestamp_tz_offset)
+        self._periodic_hour_offset: Optional[int] = None
+        self._periodic_weekday_offset: Optional[int] = None
+        if self.add_periodic_time_features:
+            # Sentinel fids -1 / -2 don't collide with the natural positive
+            # fids that come from parquet column names.
+            self._periodic_hour_offset = self.user_int_schema.total_dim
+            self.user_int_schema.add(feature_id=-1, length=1)
+            self.user_int_vocab_sizes.append(25)         # 1..24 valid; 0 padding
+            self._periodic_weekday_offset = self.user_int_schema.total_dim
+            self.user_int_schema.add(feature_id=-2, length=1)
+            self.user_int_vocab_sizes.append(8)          # 1..7 valid; 0 padding
+            logging.info(
+                f"Periodic time features ON: hour at user_int offset "
+                f"{self._periodic_hour_offset} (vocab=25), weekday at offset "
+                f"{self._periodic_weekday_offset} (vocab=8), "
+                f"tz_offset={self.timestamp_tz_offset}s"
+            )
 
         # ---- Pre-compute column index lookup ----
         pf = pq.ParquetFile(self._parquet_files[0])
@@ -556,6 +585,15 @@ class PCVRParquetDataset(IterableDataset):
                     padded[:] = 0
                 user_int[:, offset:offset + dim] = padded
 
+        # ---- periodic time features (hour, weekday) appended to user_int ----
+        # +1 shift so 0 stays as the padding bucket of the embedding table.
+        if self.add_periodic_time_features:
+            shifted_ts = timestamps.astype(np.int64) + self.timestamp_tz_offset
+            hours = ((shifted_ts % 86400) // 3600 + 1).astype(np.int64)         # 1..24
+            weekdays = ((shifted_ts // 86400 + 4) % 7 + 1).astype(np.int64)     # 1..7
+            user_int[:, self._periodic_hour_offset] = hours
+            user_int[:, self._periodic_weekday_offset] = weekdays
+
         # ---- item_int ----
         item_int = self._buf_item_int[:B]
         item_int[:] = 0
@@ -683,6 +721,8 @@ def get_pcvr_data(
     clip_vocab: bool = True,
     seq_max_lens: Optional[Dict[str, int]] = None,
     valid_num_workers: Optional[int] = None,
+    add_periodic_time_features: bool = False,
+    timestamp_tz_offset: int = 0,
     **kwargs: Any,
 ) -> Tuple[DataLoader, DataLoader, PCVRParquetDataset]:
     """Create train / valid DataLoaders from raw multi-column Parquet files.
@@ -778,6 +818,8 @@ def get_pcvr_data(
         buffer_batches=buffer_batches,
         row_group_range=train_range,
         clip_vocab=clip_vocab,
+        add_periodic_time_features=add_periodic_time_features,
+        timestamp_tz_offset=timestamp_tz_offset,
     )
 
     use_cuda = torch.cuda.is_available()
@@ -800,6 +842,8 @@ def get_pcvr_data(
         buffer_batches=0,
         row_group_range=valid_range,
         clip_vocab=clip_vocab,
+        add_periodic_time_features=add_periodic_time_features,
+        timestamp_tz_offset=timestamp_tz_offset,
     )
     if valid_num_workers is None:
         valid_num_workers = min(num_workers, 2)

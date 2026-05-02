@@ -172,6 +172,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--din_history_fid', type=int, default=47,
                         help='Which fid inside --din_history_domain is the '
                              'item_id history column.')
+    # ---- Periodic time features (hour-of-day + day-of-week) ----
+    parser.add_argument('--add_periodic_time_features', action='store_true',
+                        default=False,
+                        help='Append two synthetic columns to user_int_feats '
+                             'derived from the sample timestamp: hour_of_day '
+                             '(vocab=25, 0=padding 1..24=hours 0..23) and '
+                             'day_of_week (vocab=8, 0=padding 1..7 = Sun..Sat). '
+                             'No model code change required — they go through '
+                             'the existing user_int tokenizer / NS path.')
+    parser.add_argument('--timestamp_tz_offset', type=int, default=0,
+                        help='Seconds to add to sample timestamp before '
+                             'computing hour/weekday. Use 28800 (=8h) when '
+                             'data is in Beijing time, 0 when in UTC.')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -307,6 +320,8 @@ def main() -> None:
         seed=args.seed,
         seq_max_lens=seq_max_lens,
         valid_num_workers=valid_workers,
+        add_periodic_time_features=args.add_periodic_time_features,
+        timestamp_tz_offset=args.timestamp_tz_offset,
     )
 
     # ---- NS groups ----
