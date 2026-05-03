@@ -59,7 +59,7 @@ export TRAIN_TF_EVENTS_PATH="${TRAIN_TF_EVENTS_PATH:-${SCRIPT_DIR}/tb}"
 #                  for a regular embedding (otherwise zeroed by emb_skip).
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 2 \
+    --user_ns_tokens 3 \
     --item_ns_tokens 2 \
     --num_queries 2 \
     --ns_groups_json "" \
@@ -68,10 +68,6 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --num_workers 4 \
     --bpr_weight 0.5 \
     --time_attn_bias \
-    --din_enabled \
-    --din_hash_size 1000000 \
-    --din_history_domain seq_c \
-    --din_history_fid 47 \
     --add_periodic_time_features \
     --timestamp_tz_offset 28800 \
     --use_time_ns_token \
@@ -81,14 +77,20 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #   --add_periodic_time_features  (A,  sample-level via user_int):    GAINS
 #   --use_inter_event_features    (B,  per-token additive):           LOSSES → disabled
 #   --use_seq_periodic_time       (A+, per-token additive):           LOSSES → disabled (worse than B)
-#   --use_time_ns_token           (C,  NS-token from histograms):     GAINS
+#   --use_time_ns_token           (C,  NS-token from histograms):     GAINS (epoch 1-3, then overfits — shrunk + dropout)
 #   --use_sample_time_ns_token    (NS-form A, dedicated NS token):    to be tested
+#
+# DIN disabled: 200M observation showed DIN is net-negative even at epoch 1
+# (random 1M+1 hash table contaminates NS tokens, and we lose 1 user_ns_token
+# slot to make room). Code stays in model.py/train.py for future re-enable
+# with a saner config (smaller hash + small init + gate).
+#
 # Pattern: NS-token-position adds win, per-token-additive adds lose
 # (the d_model channel is already saturated by content + baseline time_bucket).
 #
 # T constraint with current flags:
 #   T = num_queries*num_seq + num_ns
-#     = 2*4 + (2 user + 1 user_dense + 2 item + 1 DIN + 1 TimeNS + 1 SampleTimeNS) = 16
+#     = 2*4 + (3 user + 1 user_dense + 2 item + 1 TimeNS + 1 SampleTimeNS) = 16
 #   d_model=64 % 16 = 0 ✓
-# If you toggle any single NS-emitting flag (DIN / TimeNS / SampleTimeNS),
+# If you toggle any single NS-emitting flag (TimeNS / SampleTimeNS / DIN),
 # bump user_ns_tokens by ±1 to keep T=16 divisible.
