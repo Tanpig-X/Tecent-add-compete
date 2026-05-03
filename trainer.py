@@ -426,6 +426,8 @@ class PCVRHyFormerRankingTrainer:
         if item_id is None:
             B = device_batch['user_int_feats'].shape[0]
             item_id = torch.zeros(B, dtype=torch.long, device=self.device)
+        sample_hour = device_batch.get('sample_hour_bucket')
+        sample_weekday = device_batch.get('sample_weekday_bucket')
         return ModelInput(
             user_int_feats=device_batch['user_int_feats'],
             item_int_feats=device_batch['item_int_feats'],
@@ -438,6 +440,8 @@ class PCVRHyFormerRankingTrainer:
             seq_inter_buckets=(seq_inter_buckets if seq_inter_buckets else None),
             seq_hour_buckets=(seq_hour_buckets if seq_hour_buckets else None),
             seq_weekday_buckets=(seq_weekday_buckets if seq_weekday_buckets else None),
+            sample_hour_bucket=sample_hour,
+            sample_weekday_bucket=sample_weekday,
         )
 
     def _train_step(self, batch: Dict[str, Any]) -> float:

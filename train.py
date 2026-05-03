@@ -210,6 +210,15 @@ def parse_args() -> argparse.Namespace:
                              'per-token additive time signal. Adds 1 NS token '
                              '— remember to keep d_model %% T == 0 (e.g. drop '
                              '--user_ns_tokens by 1 to compensate).')
+    parser.add_argument('--use_sample_time_ns_token', action='store_true',
+                        default=False,
+                        help='NS-form A: project sample-level hour/weekday '
+                             '(same signal as --add_periodic_time_features) '
+                             'into ONE dedicated NS token via SampleTimeNSModule. '
+                             'Stacks with the user_int routing of A; lets the '
+                             'backbone attend to circadian context without it '
+                             'being diluted in a RankMixer chunk. Adds 1 NS '
+                             'token — keep d_model %% T == 0.')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -426,6 +435,7 @@ def main() -> None:
         "use_inter_event_features": args.use_inter_event_features,
         "use_seq_periodic_time": args.use_seq_periodic_time,
         "use_time_ns_token": args.use_time_ns_token,
+        "use_sample_time_ns_token": args.use_sample_time_ns_token,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

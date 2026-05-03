@@ -59,7 +59,7 @@ export TRAIN_TF_EVENTS_PATH="${TRAIN_TF_EVENTS_PATH:-${SCRIPT_DIR}/tb}"
 #                  for a regular embedding (otherwise zeroed by emb_skip).
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 3 \
+    --user_ns_tokens 2 \
     --item_ns_tokens 2 \
     --num_queries 2 \
     --ns_groups_json "" \
@@ -75,22 +75,20 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --add_periodic_time_features \
     --timestamp_tz_offset 28800 \
     --use_time_ns_token \
+    --use_sample_time_ns_token \
     "$@"
 # Time-feature lessons learned on 200M:
-#   --add_periodic_time_features (A, sample-level NS): GAINS
-#   --use_inter_event_features   (B, per-token additive): LOSSES → disabled
-#   --use_seq_periodic_time      (A+, per-token additive): LOSSES → disabled
-#   --use_time_ns_token          (C, NS token):  to be tested
+#   --add_periodic_time_features  (A,  sample-level via user_int):    GAINS
+#   --use_inter_event_features    (B,  per-token additive):           LOSSES → disabled
+#   --use_seq_periodic_time       (A+, per-token additive):           LOSSES → disabled (worse than B)
+#   --use_time_ns_token           (C,  NS-token from histograms):     GAINS
+#   --use_sample_time_ns_token    (NS-form A, dedicated NS token):    to be tested
 # Pattern: NS-token-position adds win, per-token-additive adds lose
 # (the d_model channel is already saturated by content + baseline time_bucket).
 #
 # T constraint with current flags:
 #   T = num_queries*num_seq + num_ns
-#     = 2*4 + (3 user + 1 user_dense + 2 item + 1 DIN + 1 TimeNS) = 16
+#     = 2*4 + (2 user + 1 user_dense + 2 item + 1 DIN + 1 TimeNS + 1 SampleTimeNS) = 16
 #   d_model=64 % 16 = 0 ✓
-# If you turn off DIN OR TimeNS, bump user_ns_tokens back up by 1 to keep T=16.
-# Note on T constraint with DIN:
-#   T = num_queries*num_seq + num_ns = 2*4 + (4 user + 1 user_dense + 2 item + 1 DIN) = 16
-#   d_model=64 % T(16) = 0  ✓
-# Without DIN, the previous config used user_ns_tokens=5; opening DIN adds
-# 1 more NS token, so we drop user_ns_tokens by 1 to keep T=16 divisible.
+# If you toggle any single NS-emitting flag (DIN / TimeNS / SampleTimeNS),
+# bump user_ns_tokens by ±1 to keep T=16 divisible.

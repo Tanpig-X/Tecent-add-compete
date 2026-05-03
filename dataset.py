@@ -620,12 +620,16 @@ class PCVRParquetDataset(IterableDataset):
 
         # ---- periodic time features (hour, weekday) appended to user_int ----
         # +1 shift so 0 stays as the padding bucket of the embedding table.
+        sample_hour_arr: Optional[np.ndarray] = None
+        sample_weekday_arr: Optional[np.ndarray] = None
         if self.add_periodic_time_features:
             shifted_ts = timestamps.astype(np.int64) + self.timestamp_tz_offset
             hours = ((shifted_ts % 86400) // 3600 + 1).astype(np.int64)         # 1..24
             weekdays = ((shifted_ts // 86400 + 4) % 7 + 1).astype(np.int64)     # 1..7
             user_int[:, self._periodic_hour_offset] = hours
             user_int[:, self._periodic_weekday_offset] = weekdays
+            sample_hour_arr = hours
+            sample_weekday_arr = weekdays
 
         # ---- item_int ----
         item_int = self._buf_item_int[:B]
@@ -667,6 +671,9 @@ class PCVRParquetDataset(IterableDataset):
             'item_id': torch.from_numpy(item_ids),
             '_seq_domains': self.seq_domains,
         }
+        if sample_hour_arr is not None:
+            result['sample_hour_bucket'] = torch.from_numpy(sample_hour_arr.copy())
+            result['sample_weekday_bucket'] = torch.from_numpy(sample_weekday_arr.copy())
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain in self.seq_domains:

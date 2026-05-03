@@ -27,6 +27,11 @@ class ModelInput(NamedTuple):
     # event. None or empty dict ⇒ feature disabled.
     seq_hour_buckets: Optional[dict] = None
     seq_weekday_buckets: Optional[dict] = None
+    # Optional: sample-level periodic time bucket (B,) — same hour/weekday
+    # signal as the user_int route (A), but exposed as standalone tensors
+    # so it can be embedded into a dedicated NS token (NS-form A).
+    sample_hour_bucket: Optional[torch.Tensor] = None
+    sample_weekday_bucket: Optional[torch.Tensor] = None
 
 
 class DINModule(nn.Module):
@@ -125,15 +130,21 @@ class TimeNSModule(nn.Module):
         num_time_buckets: int,
         num_seq_domains: int,
         d_model: int,
-        hidden_mult: int = 2,
+        hidden_mult: int = 1,
+        dropout: float = 0.2,
     ) -> None:
         super().__init__()
         self.num_time_buckets = int(num_time_buckets)
         self.num_seq_domains = int(num_seq_domains)
         in_dim = self.num_time_buckets * self.num_seq_domains
+        # hidden_mult=1 + dropout=0.2: 200M training showed C boosts AUC for the
+        # first 3 epochs (~+0.008) then regresses by epoch 4 — classic memorisation
+        # of the per-user histogram fingerprint. Halving hidden width and gating
+        # with dropout slows convergence enough to avoid the late-epoch flip.
         self.proj = nn.Sequential(
             nn.Linear(in_dim, d_model * hidden_mult),
             nn.SiLU(),
+            nn.Dropout(dropout),
             nn.Linear(d_model * hidden_mult, d_model),
             nn.LayerNorm(d_model),
         )
@@ -157,6 +168,38 @@ class TimeNSModule(nn.Module):
         cat_hist = torch.cat(hists, dim=-1)              # (B, num_seq * num_time_buckets)
         out = self.proj(cat_hist)                        # (B, d_model)
         return out.unsqueeze(1)                          # (B, 1, d_model)
+
+
+class SampleTimeNSModule(nn.Module):
+    """Sample-level hour/weekday → ONE NS token (NS-form A).
+
+    Mirror of feature A (which appends hour/weekday into user_int and lets
+    the NS tokenizer mix them with the rest of the user_int channels), but
+    routed through a dedicated NS token so the backbone can attend to the
+    sample's circadian context without it being diluted by dozens of other
+    user_int features inside the RankMixer chunk.
+
+    Two separate small Embedding tables (hour vocab=25 incl. padding 0,
+    weekday vocab=8 incl. padding 0). Sum the two emb_dim vectors, then
+    SiLU + LayerNorm into d_model. Param footprint: (25+8)*emb_dim +
+    emb_dim*d_model ≈ ~4 KB at default sizes — negligible.
+    """
+
+    def __init__(self, emb_dim: int, d_model: int) -> None:
+        super().__init__()
+        self.hour_emb = nn.Embedding(25, emb_dim, padding_idx=0)
+        self.weekday_emb = nn.Embedding(8, emb_dim, padding_idx=0)
+        self.proj = nn.Sequential(
+            nn.Linear(emb_dim, d_model),
+            nn.LayerNorm(d_model),
+        )
+
+    def forward(self, hour_ids: torch.Tensor, weekday_ids: torch.Tensor) -> torch.Tensor:
+        """hour_ids, weekday_ids: (B,) long tensors. Returns (B, 1, d_model)."""
+        h = hour_ids.clamp(min=0, max=24).long()
+        w = weekday_ids.clamp(min=0, max=7).long()
+        merged = self.hour_emb(h) + self.weekday_emb(w)   # (B, emb_dim)
+        return F.silu(self.proj(merged)).unsqueeze(1)     # (B, 1, d_model)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1598,6 +1641,10 @@ class PCVRHyFormer(nn.Module):
         # token. Lets backbone attention attend to time DISTRIBUTION
         # explicitly (orthogonal to the per-token additive time signal).
         use_time_ns_token: bool = False,
+        # NS-form A: sample-level hour/weekday → 1 dedicated NS token via
+        # SampleTimeNSModule. Stacks with --add_periodic_time_features
+        # (which routes the same signal through user_int).
+        use_sample_time_ns_token: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1712,6 +1759,12 @@ class PCVRHyFormer(nn.Module):
                 d_model=d_model,
             )
 
+        # ================== Sample-level time NS token (NS-form A) ==================
+        self.use_sample_time_ns_token = bool(use_sample_time_ns_token)
+        if self.use_sample_time_ns_token:
+            self.sample_time_ns_module = SampleTimeNSModule(
+                emb_dim=emb_dim, d_model=d_model)
+
         # ================== DIN target attention ==================
         # When enabled, looks up the index of `din_history_fid` inside the
         # `din_history_domain`'s sideinfo_fids list (passed via seq_vocab_sizes
@@ -1734,7 +1787,8 @@ class PCVRHyFormer(nn.Module):
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0)
                        + (1 if din_enabled else 0)
-                       + (1 if self.use_time_ns_token else 0))
+                       + (1 if self.use_time_ns_token else 0)
+                       + (1 if self.use_sample_time_ns_token else 0))
 
         # ================== Check d_model % T == 0 constraint (full mode only) ==================
         T = num_queries * self.num_sequences + self.num_ns
@@ -2140,6 +2194,15 @@ class PCVRHyFormer(nn.Module):
             time_buckets_list = [
                 inputs.seq_time_buckets[d] for d in self.seq_domains]
             ns_parts.append(self.time_ns_module(time_buckets_list))  # (B, 1, D)
+        if self.use_sample_time_ns_token:
+            B = inputs.user_int_feats.shape[0]
+            hour = (inputs.sample_hour_bucket
+                    if inputs.sample_hour_bucket is not None
+                    else torch.zeros(B, dtype=torch.long, device=inputs.user_int_feats.device))
+            wkday = (inputs.sample_weekday_bucket
+                     if inputs.sample_weekday_bucket is not None
+                     else torch.zeros(B, dtype=torch.long, device=inputs.user_int_feats.device))
+            ns_parts.append(self.sample_time_ns_module(hour, wkday))   # (B, 1, D)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -2211,6 +2274,15 @@ class PCVRHyFormer(nn.Module):
             time_buckets_list = [
                 inputs.seq_time_buckets[d] for d in self.seq_domains]
             ns_parts.append(self.time_ns_module(time_buckets_list))
+        if self.use_sample_time_ns_token:
+            B = inputs.user_int_feats.shape[0]
+            hour = (inputs.sample_hour_bucket
+                    if inputs.sample_hour_bucket is not None
+                    else torch.zeros(B, dtype=torch.long, device=inputs.user_int_feats.device))
+            wkday = (inputs.sample_weekday_bucket
+                     if inputs.sample_weekday_bucket is not None
+                     else torch.zeros(B, dtype=torch.long, device=inputs.user_int_feats.device))
+            ns_parts.append(self.sample_time_ns_module(hour, wkday))
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 
