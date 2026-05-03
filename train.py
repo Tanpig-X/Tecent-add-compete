@@ -219,6 +219,21 @@ def parse_args() -> argparse.Namespace:
                              'backbone attend to circadian context without it '
                              'being diluted in a RankMixer chunk. Adds 1 NS '
                              'token — keep d_model %% T == 0.')
+    parser.add_argument('--delay_aux_enabled', action='store_true',
+                        default=False,
+                        help='Multi-task auxiliary head: predict log1p('
+                             'label_time-timestamp) as a regression target. '
+                             'Provides dense supervision (every sample has a '
+                             'label vs only 12.4%% positives for CVR) and '
+                             'forces the backbone to encode user engagement '
+                             'duration, which is correlated with conversion '
+                             'but not identical.')
+    parser.add_argument('--delay_aux_weight', type=float, default=0.1,
+                        help='Multiplier on the delay regression aux loss '
+                             'when --delay_aux_enabled. 0 effectively '
+                             'disables aux supervision even with the head '
+                             'on (head still constructs but contributes no '
+                             'gradient).')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -436,6 +451,7 @@ def main() -> None:
         "use_seq_periodic_time": args.use_seq_periodic_time,
         "use_time_ns_token": args.use_time_ns_token,
         "use_sample_time_ns_token": args.use_sample_time_ns_token,
+        "delay_aux_enabled": args.delay_aux_enabled,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)
@@ -504,6 +520,7 @@ def main() -> None:
         train_config=vars(args),
         use_amp=args.use_amp,
         bpr_weight=args.bpr_weight,
+        delay_aux_weight=args.delay_aux_weight,
     )
 
     trainer.train()

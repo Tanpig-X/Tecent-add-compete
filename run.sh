@@ -72,6 +72,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --timestamp_tz_offset 28800 \
     --use_time_ns_token \
     --use_sample_time_ns_token \
+    --delay_aux_enabled \
+    --delay_aux_weight 0.1 \
     "$@"
 # Time-feature lessons learned on 200M:
 #   --add_periodic_time_features  (A,  sample-level via user_int):    GAINS

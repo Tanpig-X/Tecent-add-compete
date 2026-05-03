@@ -1645,6 +1645,11 @@ class PCVRHyFormer(nn.Module):
         # SampleTimeNSModule. Stacks with --add_periodic_time_features
         # (which routes the same signal through user_int).
         use_sample_time_ns_token: bool = False,
+        # Multi-task: predict log1p(label_time - timestamp) as an auxiliary
+        # regression head sharing the backbone. Forces the backbone to encode
+        # engagement-duration signal, which is correlated with conversion
+        # without being identical (positives have ~1.5× the delay of negatives).
+        delay_aux_enabled: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1926,6 +1931,19 @@ class PCVRHyFormer(nn.Module):
             nn.Linear(d_model, action_num)
         )
 
+        # Auxiliary head: log-delay regression. Shares the same `output`
+        # (B, d_model) tensor as the classifier, gets its own MLP so the
+        # two heads can specialise without fighting over the final layer.
+        self.delay_aux_enabled = bool(delay_aux_enabled)
+        if self.delay_aux_enabled:
+            self.delay_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(d_model, 1),
+            )
+
         # Initialize parameters
         self._init_params()
 
@@ -2168,8 +2186,13 @@ class PCVRHyFormer(nn.Module):
         seq tensor) and registers it here."""
         self._din_history_fid_idx = int(fid_idx)
 
-    def forward(self, inputs: ModelInput) -> torch.Tensor:
-        """Runs the forward pass of the PCVRHyFormer model."""
+    def forward(self, inputs: ModelInput) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Runs the forward pass.
+
+        Returns ``(logits, delay_pred)`` where ``delay_pred`` is ``None``
+        unless ``delay_aux_enabled`` was set at construction time. The tuple
+        return is unconditional so the trainer always unpacks the same way.
+        """
         # 1. NS tokens: grouped projection
         # Pass dense_feats only when this tokenizer was constructed with a
         # dense pairing map; otherwise None preserves the mean-pool path.
@@ -2246,9 +2269,11 @@ class PCVRHyFormer(nn.Module):
             time_bucket_list=time_bucket_list,
         )
 
-        # 5. Classifier
+        # 5. Classifier (+ optional delay regression aux head)
         logits = self.clsfier(output)  # (B, action_num)
-        return logits
+        delay_pred = (self.delay_head(output).squeeze(-1)
+                      if self.delay_aux_enabled else None)
+        return logits, delay_pred
 
     def predict(self, inputs: ModelInput) -> Tuple[torch.Tensor, torch.Tensor]:
         """Runs inference without dropout, returning both logits and embeddings."""

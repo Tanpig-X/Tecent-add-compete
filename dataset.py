@@ -586,6 +586,20 @@ class PCVRParquetDataset(IterableDataset):
                       .to_numpy(zero_copy_only=False).astype(np.int64) == 2).astype(np.int64)
         else:
             labels = np.zeros(B, dtype=np.int64)
+
+        # Delay auxiliary target: log1p(label_time - timestamp). Available
+        # for every sample (both label_type=1 and 2 have non-zero label_time
+        # in the training data); positive samples have systematically larger
+        # delays so the regression target is correlated with the main task
+        # but not identical. Skipped when label_time isn't in the schema
+        # (e.g. real inference data) — model just won't get aux supervision.
+        delay_target_arr: Optional[np.ndarray] = None
+        label_time_ci = self._col_idx.get('label_time')
+        if label_time_ci is not None:
+            label_times = (batch.column(label_time_ci).fill_null(0)
+                           .to_numpy(zero_copy_only=False).astype(np.int64))
+            delay_sec = np.maximum(label_times - timestamps, 0).astype(np.float32)
+            delay_target_arr = np.log1p(delay_sec)
         user_ids = batch.column(self._col_idx['user_id']).to_pylist()
         # Target item_id as a tensor (not a Python list, unlike user_id) — used
         # by the optional DIN module to attend to user history.
@@ -674,6 +688,8 @@ class PCVRParquetDataset(IterableDataset):
         if sample_hour_arr is not None:
             result['sample_hour_bucket'] = torch.from_numpy(sample_hour_arr.copy())
             result['sample_weekday_bucket'] = torch.from_numpy(sample_weekday_arr.copy())
+        if delay_target_arr is not None:
+            result['delay_target'] = torch.from_numpy(delay_target_arr.copy())
 
         # ---- Sequence features: fused padding directly into the 3D buffer ----
         for domain in self.seq_domains:

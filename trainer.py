@@ -61,6 +61,7 @@ class PCVRHyFormerRankingTrainer:
         use_amp: bool = True,
         amp_dtype: torch.dtype = torch.bfloat16,
         bpr_weight: float = 0.0,
+        delay_aux_weight: float = 0.0,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -120,11 +121,17 @@ class PCVRHyFormerRankingTrainer:
         # backward compatible. Typical starting point: 0.5.
         self.bpr_weight: float = float(bpr_weight)
 
+        # Optional auxiliary regression loss on log1p(label_time-timestamp).
+        # Only contributes when the model exposes a delay_pred AND the batch
+        # carries a delay_target tensor. 0 disables. Typical start: 0.1.
+        self.delay_aux_weight: float = float(delay_aux_weight)
+
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
                      f"use_amp={self.use_amp} (dtype={self.amp_dtype}), "
-                     f"bpr_weight={self.bpr_weight}")
+                     f"bpr_weight={self.bpr_weight}, "
+                     f"delay_aux_weight={self.delay_aux_weight}")
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -455,7 +462,7 @@ class PCVRHyFormerRankingTrainer:
 
         model_input = self._make_model_input(device_batch)
         with torch.autocast(device_type='cuda', dtype=self.amp_dtype, enabled=self.use_amp):
-            logits = self.model(model_input)  # (B, 1)
+            logits, delay_pred = self.model(model_input)  # (B, 1), (B,) | None
             logits = logits.squeeze(-1)  # (B,)
             if self.loss_type == 'focal':
                 loss = sigmoid_focal_loss(logits, label, alpha=self.focal_alpha, gamma=self.focal_gamma)
@@ -466,6 +473,14 @@ class PCVRHyFormerRankingTrainer:
             # bpr_weight=0 (default) is a no-op, fully backward compatible.
             if self.bpr_weight > 0.0:
                 loss = loss + self.bpr_weight * pairwise_bpr_loss(logits, label)
+            # Optional: delay regression aux. Both gates are required so that
+            # forgetting either the model flag or the dataset flag silently
+            # disables the head instead of crashing.
+            if (self.delay_aux_weight > 0.0
+                    and delay_pred is not None
+                    and 'delay_target' in device_batch):
+                delay_target = device_batch['delay_target'].float()
+                loss = loss + self.delay_aux_weight * F.mse_loss(delay_pred, delay_target)
         loss.backward()
         # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
         # with certain tensor shapes in this project.
