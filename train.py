@@ -234,6 +234,16 @@ def parse_args() -> argparse.Namespace:
                              'disables aux supervision even with the head '
                              'on (head still constructs but contributes no '
                              'gradient).')
+    parser.add_argument('--cross_domain_seq_attn', action='store_true',
+                        default=False,
+                        help='Per HyFormer block, after per-domain Query '
+                             'Decoding add a shared cross-attention so each '
+                             'Q_i additionally attends to the concatenated '
+                             'seq tokens of ALL S domains. Pure architectural '
+                             'change; per-domain specialisation is preserved '
+                             'via the existing per-domain cross-attn module, '
+                             'and the new module layers cross-domain context '
+                             'on top via residual addition.')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -452,6 +462,7 @@ def main() -> None:
         "use_time_ns_token": args.use_time_ns_token,
         "use_sample_time_ns_token": args.use_sample_time_ns_token,
         "delay_aux_enabled": args.delay_aux_enabled,
+        "cross_domain_seq_attn": args.cross_domain_seq_attn,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

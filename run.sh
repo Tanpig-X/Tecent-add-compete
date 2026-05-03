@@ -73,6 +73,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --use_sample_time_ns_token \
     --delay_aux_enabled \
     --delay_aux_weight 0.1 \
+    --cross_domain_seq_attn \
     "$@"
 # Time-feature lessons learned on 200M:
 #   --add_periodic_time_features  (A,  sample-level via user_int):    GAINS
@@ -93,6 +94,12 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 # timestamp). 100% sample coverage (vs 12.4% positives for CVR) + correlated
 # but not identical to main task → forces backbone to encode engagement-
 # duration signal as side regularisation.
+#
+# --cross_domain_seq_attn: each backbone block adds a SHARED cross-attention
+# where each Q_i attends to the concatenated seq tokens from ALL 4 domains
+# (a/b/c/d). Per-domain specialisation in the existing per-domain cross-attn
+# is preserved; the new module layers cross-domain context on top via the
+# CrossAttention residual. Pure architectural, 0 data change.
 #
 # Pattern: NS-token-position adds win, per-token-additive adds lose
 # (the d_model channel is already saturated by content + baseline time_bucket).

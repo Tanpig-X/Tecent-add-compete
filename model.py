@@ -1138,6 +1138,7 @@ class MultiSeqHyFormerBlock(nn.Module):
         causal: bool = False,
         rank_mixer_mode: str = 'full',
         enable_time_bias: bool = False,
+        enable_cross_domain_seq_attn: bool = False,
     ) -> None:
         super().__init__()
         self.num_sequences = num_sequences
@@ -1170,6 +1171,23 @@ class MultiSeqHyFormerBlock(nn.Module):
             )
             for _ in range(num_sequences)
         ])
+
+        # Optional shared cross-domain attention. After per-domain Q decoding,
+        # each Q_i additionally attends to the CONCATENATED seq tokens from
+        # all S domains. CrossAttention's built-in residual connection means
+        # the output is `within_domain_q_i + attn_to_all_domains_seq`, so the
+        # per-domain specialisation in `cross_attns[i]` is preserved and the
+        # cross-domain signal is layered on additively. RoPE is intentionally
+        # disabled here because absolute positions differ across domains.
+        self.enable_cross_domain_seq_attn = bool(enable_cross_domain_seq_attn)
+        if self.enable_cross_domain_seq_attn:
+            self.cross_domain_attn = CrossAttention(
+                d_model=d_model,
+                num_heads=num_heads,
+                dropout=dropout,
+                ln_mode='pre',
+                enable_time_bias=enable_time_bias,
+            )
 
         # RankMixer: input token count = Nq * S + Nns
         n_total = num_queries * num_sequences + num_ns
@@ -1249,6 +1267,24 @@ class MultiSeqHyFormerBlock(nn.Module):
                 **kwargs,
             )
             decoded_qs.append(decoded_q_i)
+
+        # 2.5. Optional shared cross-domain attention. Each decoded Q_i
+        # additionally attends to the concatenated seq tokens of ALL domains.
+        # Built-in residual in CrossAttention makes the result equivalent to
+        # `within_q_i + attn(within_q_i → all_seqs)`, so within-domain
+        # specialisation stays intact and the cross-domain signal is added.
+        if self.enable_cross_domain_seq_attn:
+            all_seqs = torch.cat(next_seqs, dim=1)             # (B, sum_L, D)
+            all_masks = torch.cat(next_masks, dim=1)           # (B, sum_L)
+            all_tb = (torch.cat(time_bucket_list, dim=1)
+                      if time_bucket_list is not None else None)
+            decoded_qs = [
+                self.cross_domain_attn(
+                    dq, all_seqs, all_masks,
+                    rope_cos=None, rope_sin=None,
+                    time_bucket_kv=all_tb,
+                ) for dq in decoded_qs
+            ]
 
         # 3. Token Fusion: concatenate all decoded_q + ns_tokens
         combined = torch.cat(decoded_qs + [ns_tokens], dim=1)  # (B, Nq*S + Nns, D)
@@ -1650,6 +1686,12 @@ class PCVRHyFormer(nn.Module):
         # engagement-duration signal, which is correlated with conversion
         # without being identical (positives have ~1.5× the delay of negatives).
         delay_aux_enabled: bool = False,
+        # Cross-domain seq attention: each block adds a shared cross-attention
+        # where every Q_i attends to seq tokens from ALL S domains (not just
+        # its own). Lets information flow across user-behaviour domains
+        # (a/b/c/d) at the Q-token level. Adds ~one CrossAttention worth of
+        # params per block (d_model² * 4 ≈ 16K).
+        cross_domain_seq_attn: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1902,6 +1944,7 @@ class PCVRHyFormer(nn.Module):
                 causal=seq_causal,
                 rank_mixer_mode=rank_mixer_mode,
                 enable_time_bias=time_attn_bias,
+                enable_cross_domain_seq_attn=cross_domain_seq_attn,
             )
             for _ in range(num_hyformer_blocks)
         ])
