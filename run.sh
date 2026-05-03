@@ -74,15 +74,20 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --din_history_fid 47 \
     --add_periodic_time_features \
     --timestamp_tz_offset 28800 \
-    --use_inter_event_features \
-    --use_seq_periodic_time \
     --use_time_ns_token \
     "$@"
-# T constraint with all current NS tokens enabled:
+# Time-feature lessons learned on 200M:
+#   --add_periodic_time_features (A, sample-level NS): GAINS
+#   --use_inter_event_features   (B, per-token additive): LOSSES → disabled
+#   --use_seq_periodic_time      (A+, per-token additive): LOSSES → disabled
+#   --use_time_ns_token          (C, NS token):  to be tested
+# Pattern: NS-token-position adds win, per-token-additive adds lose
+# (the d_model channel is already saturated by content + baseline time_bucket).
+#
+# T constraint with current flags:
 #   T = num_queries*num_seq + num_ns
 #     = 2*4 + (3 user + 1 user_dense + 2 item + 1 DIN + 1 TimeNS) = 16
 #   d_model=64 % 16 = 0 ✓
-# user_ns_tokens dropped from 4 → 3 to make room for the new TimeNS token.
 # If you turn off DIN OR TimeNS, bump user_ns_tokens back up by 1 to keep T=16.
 # Note on T constraint with DIN:
 #   T = num_queries*num_seq + num_ns = 2*4 + (4 user + 1 user_dense + 2 item + 1 DIN) = 16
