@@ -59,7 +59,7 @@ export TRAIN_TF_EVENTS_PATH="${TRAIN_TF_EVENTS_PATH:-${SCRIPT_DIR}/tb}"
 #                  for a regular embedding (otherwise zeroed by emb_skip).
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
-    --user_ns_tokens 3 \
+    --user_ns_tokens 4 \
     --item_ns_tokens 2 \
     --num_queries 2 \
     --ns_groups_json "" \
@@ -70,7 +70,6 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --time_attn_bias \
     --add_periodic_time_features \
     --timestamp_tz_offset 28800 \
-    --use_time_ns_token \
     --use_sample_time_ns_token \
     --delay_aux_enabled \
     --delay_aux_weight 0.1 \
@@ -79,7 +78,10 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 #   --add_periodic_time_features  (A,  sample-level via user_int):    GAINS
 #   --use_inter_event_features    (B,  per-token additive):           LOSSES → disabled
 #   --use_seq_periodic_time       (A+, per-token additive):           LOSSES → disabled (worse than B)
-#   --use_time_ns_token           (C,  NS-token from histograms):     GAINS (epoch 1-3, then overfits — shrunk + dropout)
+#   --use_time_ns_token           (C,  NS-token from histograms):     NULL — early epoch +0.008 / late -0.008,
+#                                                                     net 0 even after shrunk + dropout.
+#                                                                     Signal redundant with time_attn_bias +
+#                                                                     per-token time_embedding + A. Disabled.
 #   --use_sample_time_ns_token    (NS-form A, dedicated NS token):    to be tested
 #
 # DIN disabled: 200M observation showed DIN is net-negative even at epoch 1
@@ -87,12 +89,17 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 # slot to make room). Code stays in model.py/train.py for future re-enable
 # with a saner config (smaller hash + small init + gate).
 #
+# --delay_aux_enabled: multi-task auxiliary head. Predicts log1p(label_time -
+# timestamp). 100% sample coverage (vs 12.4% positives for CVR) + correlated
+# but not identical to main task → forces backbone to encode engagement-
+# duration signal as side regularisation.
+#
 # Pattern: NS-token-position adds win, per-token-additive adds lose
 # (the d_model channel is already saturated by content + baseline time_bucket).
 #
 # T constraint with current flags:
 #   T = num_queries*num_seq + num_ns
-#     = 2*4 + (3 user + 1 user_dense + 2 item + 1 TimeNS + 1 SampleTimeNS) = 16
+#     = 2*4 + (4 user + 1 user_dense + 2 item + 1 SampleTimeNS) = 16
 #   d_model=64 % 16 = 0 ✓
-# If you toggle any single NS-emitting flag (TimeNS / SampleTimeNS / DIN),
+# If you toggle any single NS-emitting flag (SampleTimeNS / TimeNS / DIN),
 # bump user_ns_tokens by ±1 to keep T=16 divisible.
