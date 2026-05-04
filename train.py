@@ -263,6 +263,13 @@ def parse_args() -> argparse.Namespace:
                              'via the existing per-domain cross-attn module, '
                              'and the new module layers cross-domain context '
                              'on top via residual addition.')
+    parser.add_argument('--target_aware_query', action='store_true',
+                        default=False,
+                        help='Condition QueryGenerator seq pooling on the '
+                             'current item-side token. Does not add NS tokens '
+                             'or change T; item information is used only to '
+                             'attention-pool relevant history before Q token '
+                             'generation.')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -482,6 +489,7 @@ def main() -> None:
         "use_sample_time_ns_token": args.use_sample_time_ns_token,
         "delay_aux_enabled": args.delay_aux_enabled,
         "cross_domain_seq_attn": args.cross_domain_seq_attn,
+        "target_aware_query": args.target_aware_query,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

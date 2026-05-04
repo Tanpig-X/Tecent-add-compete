@@ -110,6 +110,11 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 # is preserved; the new module layers cross-domain context on top via the
 # CrossAttention residual. Pure architectural, 0 data change.
 #
+# --target_aware_query: current item-side tokens condition how each seq domain
+# is pooled before QueryGenerator. This avoids adding another item copy to
+# NS_flat; item info is already there, so the new signal is target-relevant
+# history selection rather than extra item capacity.
+#
 # Pattern: NS-token-position adds win, per-token-additive adds lose
 # (the d_model channel is already saturated by content + baseline time_bucket).
 #

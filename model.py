@@ -674,7 +674,9 @@ class MultiSeqQueryGenerator(nn.Module):
 
     Generates Q tokens independently for each sequence:
     For each sequence i:
-        GlobalInfo_i = Concat(F1..FM, MeanPool(Seq_i))
+        SeqSummary_i = MeanPool(Seq_i), or target-attention-pool(Seq_i)
+            when target_aware=True.
+        GlobalInfo_i = Concat(F1..FM, SeqSummary_i)
         Q_i = [FFN_{i,1}(GlobalInfo_i), ..., FFN_{i,N}(GlobalInfo_i)]
     """
 
@@ -684,12 +686,14 @@ class MultiSeqQueryGenerator(nn.Module):
         num_ns: int,
         num_queries: int,
         num_sequences: int,
-        hidden_mult: int = 4
+        hidden_mult: int = 4,
+        target_aware: bool = False,
     ) -> None:
         super().__init__()
         self.num_queries = num_queries
         self.num_sequences = num_sequences
         self.d_model = d_model
+        self.target_aware = bool(target_aware)
 
         global_info_dim = (num_ns + 1) * d_model
 
@@ -714,7 +718,8 @@ class MultiSeqQueryGenerator(nn.Module):
         self,
         ns_tokens: torch.Tensor,
         seq_tokens_list: list,
-        seq_padding_masks: list
+        seq_padding_masks: list,
+        target_token: Optional[torch.Tensor] = None,
     ) -> list:
         """Generates query tokens for each sequence.
 
@@ -723,6 +728,11 @@ class MultiSeqQueryGenerator(nn.Module):
             seq_tokens_list: List of (B, L_i, D) tensors, length S.
             seq_padding_masks: List of (B, L_i) masks, length S. True
                 indicates padding.
+            target_token: Optional (B, D) current-item context. When
+                target_aware=True, it is used to attention-pool each seq
+                instead of being concatenated into global_info. NS_flat already
+                contains item-side tokens, so this avoids duplicating item
+                information while still making the history summary target-aware.
 
         Returns:
             List of (B, Nq, D) query token tensors, length S.
@@ -732,15 +742,24 @@ class MultiSeqQueryGenerator(nn.Module):
 
         q_tokens_list = []
         for i in range(self.num_sequences):
-            # MeanPool(Seq_i)
+            # Pool Seq_i. Baseline uses mean-pool; target-aware mode uses the
+            # current item token as a query to select relevant history tokens.
             valid_mask = ~seq_padding_masks[i]  # True = valid
             valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, L_i, 1)
-            seq_sum = (seq_tokens_list[i] * valid_mask_expanded).sum(dim=1)  # (B, D)
-            seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
-            seq_pooled = seq_sum / seq_count  # (B, D)
+            if self.target_aware and target_token is not None:
+                scores = (seq_tokens_list[i] * target_token.unsqueeze(1)).sum(dim=-1)
+                scores = scores / math.sqrt(self.d_model)
+                scores = scores.masked_fill(~valid_mask, -1e4)
+                attn = torch.softmax(scores, dim=1) * valid_mask.float()
+                attn = attn / attn.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                seq_pooled = (seq_tokens_list[i] * attn.unsqueeze(-1)).sum(dim=1)
+            else:
+                seq_sum = (seq_tokens_list[i] * valid_mask_expanded).sum(dim=1)  # (B, D)
+                seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
+                seq_pooled = seq_sum / seq_count  # (B, D)
 
             # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)
-            global_info = torch.cat([ns_flat, seq_pooled], dim=-1)  # (B, (M+1)*D)
+            global_info = torch.cat([ns_flat, seq_pooled], dim=-1)
             global_info = self.global_info_norm(global_info)
 
             # Generate N query tokens
@@ -1692,6 +1711,11 @@ class PCVRHyFormer(nn.Module):
         # (a/b/c/d) at the Q-token level. Adds ~one CrossAttention worth of
         # params per block (d_model² * 4 ≈ 16K).
         cross_domain_seq_attn: bool = False,
+        # Target-aware query generation: compress the current item-side tokens
+        # into a target context and feed it into every per-domain QueryGenerator
+        # FFN. Does NOT add NS tokens, so T / RankMixer token layout is
+        # unchanged; only the Q initialisation becomes target-conditioned.
+        target_aware_query: bool = False,
     ) -> None:
         super().__init__()
 
@@ -1708,6 +1732,7 @@ class PCVRHyFormer(nn.Module):
         self.time_attn_bias = time_attn_bias
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
+        self.target_aware_query = bool(target_aware_query)
 
         # ================== NS Tokens Construction ==================
 
@@ -1795,6 +1820,13 @@ class PCVRHyFormer(nn.Module):
             self.item_dense_proj = nn.Sequential(
                 nn.Linear(item_dense_dim, d_model),
                 nn.LayerNorm(d_model),
+            )
+
+        if self.target_aware_query:
+            self.target_query_proj = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
             )
 
         # ================== Time NS token (aggregated histograms) ==================
@@ -1927,6 +1959,7 @@ class PCVRHyFormer(nn.Module):
             num_queries=num_queries,
             num_sequences=self.num_sequences,
             hidden_mult=hidden_mult,
+            target_aware=self.target_aware_query,
         )
 
         # MultiSeqHyFormerBlock stack
@@ -2229,6 +2262,20 @@ class PCVRHyFormer(nn.Module):
         seq tensor) and registers it here."""
         self._din_history_fid_idx = int(fid_idx)
 
+    def _make_target_query_token(
+        self,
+        item_ns: torch.Tensor,
+        item_dense_tok: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Compress current item-side tokens into one query-conditioning token."""
+        if not self.target_aware_query:
+            return None
+        item_parts = [item_ns]
+        if item_dense_tok is not None:
+            item_parts.append(item_dense_tok)
+        target = torch.cat(item_parts, dim=1).mean(dim=1)
+        return self.target_query_proj(target)
+
     def forward(self, inputs: ModelInput) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Runs the forward pass.
 
@@ -2251,6 +2298,7 @@ class PCVRHyFormer(nn.Module):
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
+        item_dense_tok = None
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)  # (B, 1, D)
             ns_parts.append(item_dense_tok)
@@ -2295,7 +2343,11 @@ class PCVRHyFormer(nn.Module):
             seq_masks_list.append(mask)
 
         # 3. Generate independent Q tokens per sequence via MultiSeqQueryGenerator
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        target_query_token = self._make_target_query_token(item_ns, item_dense_tok)
+        q_tokens_list = self.query_generator(
+            ns_tokens, seq_tokens_list, seq_masks_list,
+            target_token=target_query_token,
+        )
 
         # 4. Dropout + MultiSeqHyFormerBlock stack + output projection
         # Pass time_bucket only when this model was constructed with the
@@ -2333,6 +2385,7 @@ class PCVRHyFormer(nn.Module):
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
             ns_parts.append(user_dense_tok)
         ns_parts.append(item_ns)
+        item_dense_tok = None
         if self.has_item_dense:
             item_dense_tok = F.silu(self.item_dense_proj(inputs.item_dense_feats)).unsqueeze(1)
             ns_parts.append(item_dense_tok)
@@ -2375,7 +2428,11 @@ class PCVRHyFormer(nn.Module):
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
 
-        q_tokens_list = self.query_generator(ns_tokens, seq_tokens_list, seq_masks_list)
+        target_query_token = self._make_target_query_token(item_ns, item_dense_tok)
+        q_tokens_list = self.query_generator(
+            ns_tokens, seq_tokens_list, seq_masks_list,
+            target_token=target_query_token,
+        )
 
         time_bucket_list = (
             [inputs.seq_time_buckets[d] for d in self.seq_domains]
