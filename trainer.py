@@ -8,6 +8,7 @@ import os
 import glob
 import shutil
 import logging
+import math
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
@@ -62,6 +63,11 @@ class PCVRHyFormerRankingTrainer:
         amp_dtype: torch.dtype = torch.bfloat16,
         bpr_weight: float = 0.0,
         delay_aux_weight: float = 0.0,
+        lr_schedule: str = 'constant',
+        warmup_steps: int = 0,
+        warmup_ratio: float = 0.0,
+        min_lr_ratio: float = 0.1,
+        grad_clip_norm: float = 1.0,
     ) -> None:
         self.model: nn.Module = model
         self.train_loader: DataLoader = train_loader
@@ -125,13 +131,46 @@ class PCVRHyFormerRankingTrainer:
         # Only contributes when the model exposes a delay_pred AND the batch
         # carries a delay_target tensor. 0 disables. Typical start: 0.1.
         self.delay_aux_weight: float = float(delay_aux_weight)
+        self.lr_schedule: str = lr_schedule
+        self.total_train_steps: int = max(1, len(self.train_loader) * self.num_epochs)
+        self.warmup_steps: int = int(warmup_steps)
+        if self.warmup_steps <= 0 and warmup_ratio > 0:
+            self.warmup_steps = int(self.total_train_steps * warmup_ratio)
+        self.warmup_steps = max(0, min(self.warmup_steps, self.total_train_steps - 1))
+        self.min_lr_ratio: float = float(min_lr_ratio)
+        self.grad_clip_norm: float = float(grad_clip_norm)
+        self._last_grad_norm: Optional[float] = None
+
+        self.dense_scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None
+        if self.lr_schedule == 'warmup_cosine':
+            self.dense_scheduler = torch.optim.lr_scheduler.LambdaLR(
+                self.dense_optimizer,
+                lr_lambda=self._dense_lr_lambda,
+            )
+        elif self.lr_schedule != 'constant':
+            raise ValueError(f"Unknown lr_schedule: {self.lr_schedule}")
 
         logging.info(f"PCVRHyFormerRankingTrainer loss_type={loss_type}, "
                      f"focal_alpha={focal_alpha}, focal_gamma={focal_gamma}, "
                      f"reinit_sparse_after_epoch={reinit_sparse_after_epoch}, "
                      f"use_amp={self.use_amp} (dtype={self.amp_dtype}), "
                      f"bpr_weight={self.bpr_weight}, "
-                     f"delay_aux_weight={self.delay_aux_weight}")
+                     f"delay_aux_weight={self.delay_aux_weight}, "
+                     f"lr_schedule={self.lr_schedule}, "
+                     f"warmup_steps={self.warmup_steps}, "
+                     f"total_train_steps={self.total_train_steps}, "
+                     f"min_lr_ratio={self.min_lr_ratio}, "
+                     f"grad_clip_norm={self.grad_clip_norm}")
+
+    def _dense_lr_lambda(self, step: int) -> float:
+        """Warmup-cosine multiplier for dense AdamW parameters only."""
+        if self.warmup_steps > 0 and step < self.warmup_steps:
+            return float(step + 1) / float(self.warmup_steps)
+
+        decay_steps = max(1, self.total_train_steps - self.warmup_steps)
+        progress = min(1.0, max(0.0, (step - self.warmup_steps) / decay_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return self.min_lr_ratio + (1.0 - self.min_lr_ratio) * cosine
 
     def _build_step_dir_name(self, global_step: int, is_best: bool = False) -> str:
         """Build a checkpoint sub-directory name such as
@@ -328,8 +367,22 @@ class PCVRHyFormerRankingTrainer:
 
                 if self.writer:
                     self.writer.add_scalar('Loss/train', loss, total_step)
+                    self.writer.add_scalar(
+                        'LR/dense',
+                        self.dense_optimizer.param_groups[0]['lr'],
+                        total_step,
+                    )
+                    if self._last_grad_norm is not None:
+                        self.writer.add_scalar(
+                            'GradNorm/global',
+                            self._last_grad_norm,
+                            total_step,
+                        )
 
-                train_pbar.set_postfix({"loss": f"{loss:.4f}"})
+                train_pbar.set_postfix({
+                    "loss": f"{loss:.4f}",
+                    "lr": f"{self.dense_optimizer.param_groups[0]['lr']:.2e}",
+                })
 
                 # Step-level validation (only when eval_every_n_steps > 0).
                 if self.eval_every_n_steps > 0 and total_step % self.eval_every_n_steps == 0:
@@ -482,13 +535,23 @@ class PCVRHyFormerRankingTrainer:
                 delay_target = device_batch['delay_target'].float()
                 loss = loss + self.delay_aux_weight * F.mse_loss(delay_pred, delay_target)
         loss.backward()
-        # foreach=False: avoids a PyTorch _foreach_norm CUDA kernel bug observed
-        # with certain tensor shapes in this project.
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0, foreach=False)
+        if self.grad_clip_norm > 0.0:
+            # foreach=False avoids a PyTorch _foreach_norm CUDA kernel bug
+            # observed with certain tensor shapes in this project.
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                max_norm=self.grad_clip_norm,
+                foreach=False,
+            )
+            self._last_grad_norm = float(grad_norm.detach().cpu())
+        else:
+            self._last_grad_norm = None
 
         self.dense_optimizer.step()
         if self.sparse_optimizer is not None:
             self.sparse_optimizer.step()
+        if self.dense_scheduler is not None:
+            self.dense_scheduler.step()
 
         return loss.item()
 

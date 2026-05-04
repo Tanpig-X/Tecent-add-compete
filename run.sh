@@ -57,6 +57,11 @@ export TRAIN_TF_EVENTS_PATH="${TRAIN_TF_EVENTS_PATH:-${SCRIPT_DIR}/tb}"
 #                  item-id history (seq_c[fid=47]). Output added as 1 NS token.
 #                  Critical because that history's vocab is ~3.34e8 — too big
 #                  for a regular embedding (otherwise zeroed by emb_skip).
+# --lr_schedule warmup_cosine: stabilises dense AdamW updates. Sparse Adagrad
+#                  remains constant-lr because embedding tables usually benefit
+#                  from continued adaptation on reused / skewed ids.
+# --grad_clip_norm 1.0: keeps the existing global-norm clipping behaviour but
+#                  makes it explicit and tunable from the launch command.
 python3 -u "${SCRIPT_DIR}/train.py" \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 4 \
@@ -66,6 +71,10 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --emb_skip_threshold 1000000 \
     --batch_size 8 \
     --num_workers 4 \
+    --lr_schedule warmup_cosine \
+    --warmup_ratio 0.03 \
+    --min_lr_ratio 0.1 \
+    --grad_clip_norm 1.0 \
     --bpr_weight 0.5 \
     --time_attn_bias \
     --add_periodic_time_features \

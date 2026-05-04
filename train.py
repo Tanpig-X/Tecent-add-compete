@@ -56,6 +56,25 @@ def parse_args() -> argparse.Namespace:
                         help='Batch size for both training and validation')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='Learning rate for dense parameters (AdamW)')
+    parser.add_argument('--lr_schedule', type=str, default='constant',
+                        choices=['constant', 'warmup_cosine'],
+                        help='Dense AdamW learning-rate schedule. constant '
+                             'keeps the historical behaviour; warmup_cosine '
+                             'linearly warms up then cosine-decays to '
+                             '--min_lr_ratio * --lr. Sparse Adagrad LR is '
+                             'kept constant.')
+    parser.add_argument('--warmup_steps', type=int, default=0,
+                        help='Number of dense AdamW warmup steps. 0 means use '
+                             '--warmup_ratio when it is >0; otherwise no '
+                             'warmup.')
+    parser.add_argument('--warmup_ratio', type=float, default=0.0,
+                        help='Warmup ratio of total train steps, used only '
+                             'when --warmup_steps <= 0.')
+    parser.add_argument('--min_lr_ratio', type=float, default=0.1,
+                        help='Final LR ratio for warmup_cosine schedule.')
+    parser.add_argument('--grad_clip_norm', type=float, default=1.0,
+                        help='Global gradient norm clipping threshold. '
+                             '<=0 disables clipping.')
     parser.add_argument('--num_epochs', type=int, default=999,
                         help='Maximum number of training epochs '
                              '(typically terminated earlier by early stopping)')
@@ -532,6 +551,11 @@ def main() -> None:
         use_amp=args.use_amp,
         bpr_weight=args.bpr_weight,
         delay_aux_weight=args.delay_aux_weight,
+        lr_schedule=args.lr_schedule,
+        warmup_steps=args.warmup_steps,
+        warmup_ratio=args.warmup_ratio,
+        min_lr_ratio=args.min_lr_ratio,
+        grad_clip_norm=args.grad_clip_norm,
     )
 
     trainer.train()
