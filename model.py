@@ -170,6 +170,55 @@ class TimeNSModule(nn.Module):
         return out.unsqueeze(1)                          # (B, 1, d_model)
 
 
+class SeqTimeGateModule(nn.Module):
+    """Per-domain time-summary gate for sequence tokens.
+
+    This keeps time information on the sequence side: a domain's time-bucket
+    histogram produces a d_model gate that modulates that same domain's seq
+    tokens. It does not add NS tokens and therefore does not change T.
+    """
+
+    def __init__(
+        self,
+        num_time_buckets: int,
+        d_model: int,
+        dropout: float = 0.1,
+        gate_scale: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.num_time_buckets = int(num_time_buckets)
+        self.gate_scale = float(gate_scale)
+        self.net = nn.Sequential(
+            nn.Linear(self.num_time_buckets, d_model),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+        # Start as exact identity: seq_tokens * (1 + 0).
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(
+        self,
+        seq_tokens: torch.Tensor,
+        time_buckets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Modulate seq_tokens using a histogram of its own time buckets.
+
+        Args:
+            seq_tokens: (B, L, D)
+            time_buckets: (B, L), 0=padding
+        """
+        B = time_buckets.shape[0]
+        hist = time_buckets.new_zeros(B, self.num_time_buckets, dtype=torch.float)
+        idx = time_buckets.clamp(min=0, max=self.num_time_buckets - 1).long()
+        hist.scatter_add_(1, idx, torch.ones_like(idx, dtype=torch.float))
+        hist[:, 0] = 0
+        hist = torch.log1p(hist)
+        delta = torch.tanh(self.net(hist)) * self.gate_scale
+        return seq_tokens * (1.0 + delta.unsqueeze(1))
+
+
 class SampleTimeNSModule(nn.Module):
     """Sample-level hour/weekday → ONE NS token (NS-form A).
 
@@ -1716,6 +1765,11 @@ class PCVRHyFormer(nn.Module):
         # FFN. Does NOT add NS tokens, so T / RankMixer token layout is
         # unchanged; only the Q initialisation becomes target-conditioned.
         target_aware_query: bool = False,
+        # Per-domain time gate: comma-selected seq domains get their own
+        # time-bucket histogram converted to a d_model multiplicative gate
+        # on that domain's seq tokens. No NS token is added, so T is unchanged.
+        seq_time_gate_domains: Optional[List[str]] = None,
+        seq_time_gate_scale: float = 0.5,
     ) -> None:
         super().__init__()
 
@@ -1733,6 +1787,13 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.target_aware_query = bool(target_aware_query)
+        self.seq_time_gate_domains = set(seq_time_gate_domains or [])
+        unknown_gate_domains = self.seq_time_gate_domains - set(self.seq_domains)
+        if unknown_gate_domains:
+            raise ValueError(
+                f"Unknown seq_time_gate_domains={sorted(unknown_gate_domains)}; "
+                f"available seq_domains={self.seq_domains}"
+            )
 
         # ================== NS Tokens Construction ==================
 
@@ -1914,6 +1975,7 @@ class PCVRHyFormer(nn.Module):
         self._seq_is_id = {}        # domain -> is_id list
         self._seq_vocab_sizes = {}  # domain -> vocab_sizes list
         self._seq_proj = nn.ModuleDict()
+        self.seq_time_gates = nn.ModuleDict()
 
         for domain in self.seq_domains:
             vs = seq_vocab_sizes[domain]
@@ -1926,6 +1988,12 @@ class PCVRHyFormer(nn.Module):
                 nn.Linear(len(vs) * emb_dim, d_model),
                 nn.LayerNorm(d_model),
             )
+            if domain in self.seq_time_gate_domains and num_time_buckets > 0:
+                self.seq_time_gates[domain] = SeqTimeGateModule(
+                    num_time_buckets=num_time_buckets,
+                    d_model=d_model,
+                    gate_scale=seq_time_gate_scale,
+                )
 
         # ================== Time Interval Bucket Embedding (optional) ==================
         if num_time_buckets > 0:
@@ -2338,6 +2406,9 @@ class PCVRHyFormer(nn.Module):
                 inter_bucket_ids=inter_b,
                 hour_bucket_ids=hour_b,
                 weekday_bucket_ids=wkday_b)
+            if domain in self.seq_time_gates:
+                tokens = self.seq_time_gates[domain](
+                    tokens, inputs.seq_time_buckets[domain])
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)
@@ -2424,6 +2495,9 @@ class PCVRHyFormer(nn.Module):
                 inter_bucket_ids=inter_b,
                 hour_bucket_ids=hour_b,
                 weekday_bucket_ids=wkday_b)
+            if domain in self.seq_time_gates:
+                tokens = self.seq_time_gates[domain](
+                    tokens, inputs.seq_time_buckets[domain])
             seq_tokens_list.append(tokens)
             mask = self._make_padding_mask(inputs.seq_lens[domain], inputs.seq_data[domain].shape[2])
             seq_masks_list.append(mask)

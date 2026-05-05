@@ -270,6 +270,15 @@ def parse_args() -> argparse.Namespace:
                              'or change T; item information is used only to '
                              'attention-pool relevant history before Q token '
                              'generation.')
+    parser.add_argument('--seq_time_gate_domains', type=str, default='',
+                        help='Comma-separated seq domains whose time-bucket '
+                             'histogram gates their own seq tokens, e.g. '
+                             '"seq_c" or "seq_c,seq_d". Empty = disabled. '
+                             'Does not add NS tokens or change T.')
+    parser.add_argument('--seq_time_gate_scale', type=float, default=0.5,
+                        help='Maximum multiplicative delta for '
+                             '--seq_time_gate_domains. Gate starts as identity '
+                             'because the final projection is zero-initialized.')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -338,6 +347,10 @@ def parse_args() -> argparse.Namespace:
     args.ckpt_dir = os.environ.get('TRAIN_CKPT_PATH', args.ckpt_dir)
     args.log_dir = os.environ.get('TRAIN_LOG_PATH', args.log_dir)
     args.tf_events_dir = os.environ.get('TRAIN_TF_EVENTS_PATH')
+    args.seq_time_gate_domains = [
+        d.strip() for d in args.seq_time_gate_domains.split(',')
+        if d.strip()
+    ]
 
     return args
 
@@ -490,6 +503,8 @@ def main() -> None:
         "delay_aux_enabled": args.delay_aux_enabled,
         "cross_domain_seq_attn": args.cross_domain_seq_attn,
         "target_aware_query": args.target_aware_query,
+        "seq_time_gate_domains": args.seq_time_gate_domains,
+        "seq_time_gate_scale": args.seq_time_gate_scale,
     }
 
     model = PCVRHyFormer(**model_args).to(args.device)

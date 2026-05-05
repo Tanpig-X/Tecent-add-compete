@@ -115,6 +115,11 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 # NS_flat; item info is already there, so the new signal is target-relevant
 # history selection rather than extra item capacity.
 #
+# --seq_time_gate_domains seq_c: per-domain time gate. The selected domain's
+# time-bucket histogram modulates its own seq tokens, keeping the signal on
+# the seq side and avoiding extra NS tokens / T changes. Use comma-separated
+# domains for combinations, e.g. seq_c,seq_d.
+#
 # Pattern: NS-token-position adds win, per-token-additive adds lose
 # (the d_model channel is already saturated by content + baseline time_bucket).
 #
