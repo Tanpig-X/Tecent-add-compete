@@ -220,7 +220,7 @@ class SeqTimeGateModule(nn.Module):
 
 
 class SampleTimeNSModule(nn.Module):
-    """Sample-level hour/weekday → ONE NS token (NS-form A).
+    """Sample-level hour-weekday joint bucket -> ONE NS token (NS-form A).
 
     Mirror of feature A (which appends hour/weekday into user_int and lets
     the NS tokenizer mix them with the rest of the user_int channels), but
@@ -228,16 +228,13 @@ class SampleTimeNSModule(nn.Module):
     sample's circadian context without it being diluted by dozens of other
     user_int features inside the RankMixer chunk.
 
-    Two separate small Embedding tables (hour vocab=25 incl. padding 0,
-    weekday vocab=8 incl. padding 0). Sum the two emb_dim vectors, then
-    SiLU + LayerNorm into d_model. Param footprint: (25+8)*emb_dim +
-    emb_dim*d_model ≈ ~4 KB at default sizes — negligible.
+    Instead of two additive embeddings, use one 24*7 joint bucket so each
+    hour-weekday combination can learn its own context.
     """
 
     def __init__(self, emb_dim: int, d_model: int) -> None:
         super().__init__()
-        self.hour_emb = nn.Embedding(25, emb_dim, padding_idx=0)
-        self.weekday_emb = nn.Embedding(8, emb_dim, padding_idx=0)
+        self.joint_emb = nn.Embedding(24 * 7 + 1, emb_dim, padding_idx=0)
         self.proj = nn.Sequential(
             nn.Linear(emb_dim, d_model),
             nn.LayerNorm(d_model),
@@ -247,7 +244,9 @@ class SampleTimeNSModule(nn.Module):
         """hour_ids, weekday_ids: (B,) long tensors. Returns (B, 1, d_model)."""
         h = hour_ids.clamp(min=0, max=24).long()
         w = weekday_ids.clamp(min=0, max=7).long()
-        merged = self.hour_emb(h) + self.weekday_emb(w)   # (B, emb_dim)
+        valid = (h > 0) & (w > 0)
+        joint = ((h - 1) * 7 + w).masked_fill(~valid, 0)
+        merged = self.joint_emb(joint)                    # (B, emb_dim)
         return F.silu(self.proj(merged)).unsqueeze(1)     # (B, 1, d_model)
 
 
