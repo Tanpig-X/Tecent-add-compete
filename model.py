@@ -736,17 +736,32 @@ class MultiSeqQueryGenerator(nn.Module):
         num_sequences: int,
         hidden_mult: int = 4,
         target_aware: bool = False,
+        adaptive_pooling: bool = False,
     ) -> None:
         super().__init__()
         self.num_queries = num_queries
         self.num_sequences = num_sequences
         self.d_model = d_model
         self.target_aware = bool(target_aware)
+        self.adaptive_pooling = bool(adaptive_pooling)
 
         global_info_dim = (num_ns + 1) * d_model
 
         # LayerNorm on global_info to prevent gradient explosion from large-dim concat
         self.global_info_norm = nn.LayerNorm(global_info_dim)
+
+        if self.adaptive_pooling:
+            attn_hidden = max(d_model // 2, 16)
+            self.pool_attn_per_seq = nn.ModuleList([
+                nn.Sequential(
+                    nn.LayerNorm(d_model),
+                    nn.Linear(d_model, attn_hidden),
+                    nn.SiLU(),
+                    nn.Linear(attn_hidden, 1),
+                )
+                for _ in range(num_sequences)
+            ])
+            self.pool_alpha = nn.Parameter(torch.zeros(num_sequences))
 
         # Each sequence has N independent FFNs
         self.query_ffns_per_seq = nn.ModuleList([
@@ -794,6 +809,9 @@ class MultiSeqQueryGenerator(nn.Module):
             # current item token as a query to select relevant history tokens.
             valid_mask = ~seq_padding_masks[i]  # True = valid
             valid_mask_expanded = valid_mask.unsqueeze(-1).float()  # (B, L_i, 1)
+            seq_sum = (seq_tokens_list[i] * valid_mask_expanded).sum(dim=1)  # (B, D)
+            seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
+            mean_pooled = seq_sum / seq_count  # (B, D)
             if self.target_aware and target_token is not None:
                 scores = (seq_tokens_list[i] * target_token.unsqueeze(1)).sum(dim=-1)
                 scores = scores / math.sqrt(self.d_model)
@@ -801,10 +819,16 @@ class MultiSeqQueryGenerator(nn.Module):
                 attn = torch.softmax(scores, dim=1) * valid_mask.float()
                 attn = attn / attn.sum(dim=1, keepdim=True).clamp(min=1e-6)
                 seq_pooled = (seq_tokens_list[i] * attn.unsqueeze(-1)).sum(dim=1)
+            elif self.adaptive_pooling:
+                scores = self.pool_attn_per_seq[i](seq_tokens_list[i]).squeeze(-1)
+                scores = scores.masked_fill(~valid_mask, -1e4)
+                attn = torch.softmax(scores, dim=1) * valid_mask.float()
+                attn = attn / attn.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                attn_pooled = (seq_tokens_list[i] * attn.unsqueeze(-1)).sum(dim=1)
+                alpha = torch.tanh(self.pool_alpha[i])
+                seq_pooled = mean_pooled + alpha * (attn_pooled - mean_pooled)
             else:
-                seq_sum = (seq_tokens_list[i] * valid_mask_expanded).sum(dim=1)  # (B, D)
-                seq_count = valid_mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
-                seq_pooled = seq_sum / seq_count  # (B, D)
+                seq_pooled = mean_pooled
 
             # GlobalInfo_i = Concat(NS_flat, seq_pooled_i)
             global_info = torch.cat([ns_flat, seq_pooled], dim=-1)
@@ -1764,6 +1788,9 @@ class PCVRHyFormer(nn.Module):
         # FFN. Does NOT add NS tokens, so T / RankMixer token layout is
         # unchanged; only the Q initialisation becomes target-conditioned.
         target_aware_query: bool = False,
+        # Residual learned attention pooling for QueryGenerator seq summaries.
+        # Starts exactly as mean pooling via zero-initialized residual weight.
+        adaptive_query_pooling: bool = False,
         # Per-domain time gate: comma-selected seq domains get their own
         # time-bucket histogram converted to a d_model multiplicative gate
         # on that domain's seq tokens. No NS token is added, so T is unchanged.
@@ -1786,6 +1813,7 @@ class PCVRHyFormer(nn.Module):
         self.seq_id_threshold = seq_id_threshold
         self.ns_tokenizer_type = ns_tokenizer_type
         self.target_aware_query = bool(target_aware_query)
+        self.adaptive_query_pooling = bool(adaptive_query_pooling)
         self.seq_time_gate_domains = set(seq_time_gate_domains or [])
         unknown_gate_domains = self.seq_time_gate_domains - set(self.seq_domains)
         if unknown_gate_domains:
@@ -2027,6 +2055,7 @@ class PCVRHyFormer(nn.Module):
             num_sequences=self.num_sequences,
             hidden_mult=hidden_mult,
             target_aware=self.target_aware_query,
+            adaptive_pooling=self.adaptive_query_pooling,
         )
 
         # MultiSeqHyFormerBlock stack

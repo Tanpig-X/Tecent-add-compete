@@ -270,6 +270,14 @@ def parse_args() -> argparse.Namespace:
                              'or change T; item information is used only to '
                              'attention-pool relevant history before Q token '
                              'generation.')
+    parser.add_argument('--adaptive_query_pooling', action='store_true',
+                        default=False,
+                        help='Use residual learned attention pooling for each '
+                             'QueryGenerator sequence summary. Starts exactly '
+                             'as mean pooling via zero-initialized residual '
+                             'weight, then can adapt per sequence during '
+                             'training. Ignored when --target_aware_query is '
+                             'active.')
     parser.add_argument('--seq_time_gate_domains', type=str, default='',
                         help='Comma-separated seq domains whose time-bucket '
                              'histogram gates their own seq tokens, e.g. '
@@ -503,6 +511,7 @@ def main() -> None:
         "delay_aux_enabled": args.delay_aux_enabled,
         "cross_domain_seq_attn": args.cross_domain_seq_attn,
         "target_aware_query": args.target_aware_query,
+        "adaptive_query_pooling": args.adaptive_query_pooling,
         "seq_time_gate_domains": args.seq_time_gate_domains,
         "seq_time_gate_scale": args.seq_time_gate_scale,
     }
