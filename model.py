@@ -170,6 +170,53 @@ class TimeNSModule(nn.Module):
         return out.unsqueeze(1)                          # (B, 1, d_model)
 
 
+class TimeGateUserNSModule(nn.Module):
+    """Use the time-summary token to modulate existing user NS tokens.
+
+    This deliberately does not add an NS token, so RankMixer's T stays
+    unchanged. The final projection is zero-initialized, making the module an
+    exact identity at initialization:
+
+        user_ns_out = user_ns * (1 + 0)
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        hidden_mult: int = 1,
+        gate_scale: float = 0.5,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.gate_scale = float(gate_scale)
+        hidden_dim = d_model * hidden_mult
+        self.net = nn.Sequential(
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(
+        self,
+        user_ns: torch.Tensor,
+        time_token: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply a feature-wise multiplicative gate to user NS tokens.
+
+        Args:
+            user_ns: (B, U, D) user-side NS tokens.
+            time_token: (B, 1, D) or (B, D) time-summary token.
+        """
+        if time_token.dim() == 3:
+            time_token = time_token.squeeze(1)
+        delta = torch.tanh(self.net(time_token)) * self.gate_scale
+        return user_ns * (1.0 + delta.unsqueeze(1))
+
+
 class SeqTimeGateModule(nn.Module):
     """Per-domain time-summary gate for sequence tokens.
 
@@ -1768,6 +1815,10 @@ class PCVRHyFormer(nn.Module):
         # token. Lets backbone attention attend to time DISTRIBUTION
         # explicitly (orthogonal to the per-token additive time signal).
         use_time_ns_token: bool = False,
+        # Reuse the time-summary token as a zero-initialized gate over the
+        # existing user NS tokens. This adds no NS token and does not change T.
+        time_gate_user_ns: bool = False,
+        time_gate_user_ns_scale: float = 0.5,
         # NS-form A: sample-level hour/weekday → 1 dedicated NS token via
         # SampleTimeNSModule. Stacks with --add_periodic_time_features
         # (which routes the same signal through user_int).
@@ -1919,11 +1970,17 @@ class PCVRHyFormer(nn.Module):
 
         # ================== Time NS token (aggregated histograms) ==================
         self.use_time_ns_token = bool(use_time_ns_token)
-        if self.use_time_ns_token and num_time_buckets > 0:
+        self.time_gate_user_ns = bool(time_gate_user_ns and num_time_buckets > 0)
+        if (self.use_time_ns_token or self.time_gate_user_ns) and num_time_buckets > 0:
             self.time_ns_module = TimeNSModule(
                 num_time_buckets=num_time_buckets,
                 num_seq_domains=self.num_sequences,
                 d_model=d_model,
+            )
+        if self.time_gate_user_ns:
+            self.time_gate_user_ns_module = TimeGateUserNSModule(
+                d_model=d_model,
+                gate_scale=time_gate_user_ns_scale,
             )
 
         # ================== Sample-level time NS token (NS-form A) ==================
@@ -2389,6 +2446,14 @@ class PCVRHyFormer(nn.Module):
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats, user_dense_for_pair)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats, item_dense_for_pair)   # (B, num_item_groups, D)
 
+        time_ns_tok = None
+        if self.use_time_ns_token or self.time_gate_user_ns:
+            time_buckets_list = [
+                inputs.seq_time_buckets[d] for d in self.seq_domains]
+            time_ns_tok = self.time_ns_module(time_buckets_list)  # (B, 1, D)
+        if self.time_gate_user_ns and time_ns_tok is not None:
+            user_ns = self.time_gate_user_ns_module(user_ns, time_ns_tok)
+
         ns_parts = [user_ns]
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)  # (B, 1, D)
@@ -2400,10 +2465,8 @@ class PCVRHyFormer(nn.Module):
             ns_parts.append(item_dense_tok)
         if self.din_enabled:
             ns_parts.append(self._compute_din_token(inputs))         # (B, 1, D)
-        if self.use_time_ns_token:
-            time_buckets_list = [
-                inputs.seq_time_buckets[d] for d in self.seq_domains]
-            ns_parts.append(self.time_ns_module(time_buckets_list))  # (B, 1, D)
+        if self.use_time_ns_token and time_ns_tok is not None:
+            ns_parts.append(time_ns_tok)  # (B, 1, D)
         if self.use_sample_time_ns_token:
             B = inputs.user_int_feats.shape[0]
             hour = (inputs.sample_hour_bucket
@@ -2479,6 +2542,14 @@ class PCVRHyFormer(nn.Module):
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats, user_dense_for_pair)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats, item_dense_for_pair)
 
+        time_ns_tok = None
+        if self.use_time_ns_token or self.time_gate_user_ns:
+            time_buckets_list = [
+                inputs.seq_time_buckets[d] for d in self.seq_domains]
+            time_ns_tok = self.time_ns_module(time_buckets_list)
+        if self.time_gate_user_ns and time_ns_tok is not None:
+            user_ns = self.time_gate_user_ns_module(user_ns, time_ns_tok)
+
         ns_parts = [user_ns]
         if self.has_user_dense:
             user_dense_tok = F.silu(self.user_dense_proj(inputs.user_dense_feats)).unsqueeze(1)
@@ -2490,10 +2561,8 @@ class PCVRHyFormer(nn.Module):
             ns_parts.append(item_dense_tok)
         if self.din_enabled:
             ns_parts.append(self._compute_din_token(inputs))
-        if self.use_time_ns_token:
-            time_buckets_list = [
-                inputs.seq_time_buckets[d] for d in self.seq_domains]
-            ns_parts.append(self.time_ns_module(time_buckets_list))
+        if self.use_time_ns_token and time_ns_tok is not None:
+            ns_parts.append(time_ns_tok)
         if self.use_sample_time_ns_token:
             B = inputs.user_int_feats.shape[0]
             hour = (inputs.sample_hour_bucket

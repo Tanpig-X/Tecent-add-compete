@@ -110,7 +110,7 @@ def parse_args() -> argparse.Namespace:
                         help='Shuffle buffer size, in units of batches. '
                              'Lower values reduce memory usage.')
     parser.add_argument('--train_ratio', type=float, default=1.0,
-                        help='Fraction of training Row Groups to use (takes the first N%)')
+                        help='Fraction of training Row Groups to use (takes the first N%%)')
     parser.add_argument('--valid_ratio', type=float, default=0.1,
                         help='Fraction of all Row Groups used for validation (takes the tail)')
     parser.add_argument('--eval_every_n_steps', type=int, default=0,
@@ -229,6 +229,17 @@ def parse_args() -> argparse.Namespace:
                              'per-token additive time signal. Adds 1 NS token '
                              '— remember to keep d_model %% T == 0 (e.g. drop '
                              '--user_ns_tokens by 1 to compensate).')
+    parser.add_argument('--time_gate_user_ns', action='store_true',
+                        default=False,
+                        help='Use the same TimeNSModule time-summary vector '
+                             'to multiplicatively gate existing user NS '
+                             'tokens. This adds no NS token and does not '
+                             'change T. The gate is zero-initialized, so the '
+                             'model starts exactly equivalent to the base.')
+    parser.add_argument('--time_gate_user_ns_scale', type=float, default=0.5,
+                        help='Maximum multiplicative delta for '
+                             '--time_gate_user_ns. The learned gate is '
+                             'tanh-bounded then multiplied by this value.')
     parser.add_argument('--use_sample_time_ns_token', action='store_true',
                         default=False,
                         help='NS-form A: project sample-level hour/weekday '
@@ -507,6 +518,8 @@ def main() -> None:
         "use_inter_event_features": args.use_inter_event_features,
         "use_seq_periodic_time": args.use_seq_periodic_time,
         "use_time_ns_token": args.use_time_ns_token,
+        "time_gate_user_ns": args.time_gate_user_ns,
+        "time_gate_user_ns_scale": args.time_gate_user_ns_scale,
         "use_sample_time_ns_token": args.use_sample_time_ns_token,
         "delay_aux_enabled": args.delay_aux_enabled,
         "cross_domain_seq_attn": args.cross_domain_seq_attn,

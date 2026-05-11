@@ -79,6 +79,7 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --time_attn_bias \
     --add_periodic_time_features \
     --timestamp_tz_offset 28800 \
+    --time_gate_user_ns \
     --use_sample_time_ns_token \
     --delay_aux_enabled \
     --delay_aux_weight 0.1 \
@@ -119,6 +120,11 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 # time-bucket histogram modulates its own seq tokens, keeping the signal on
 # the seq side and avoiding extra NS tokens / T changes. Use comma-separated
 # domains for combinations, e.g. seq_c,seq_d.
+#
+# --time_gate_user_ns: reuse TimeNSModule's per-domain time histogram summary
+# as a zero-initialized multiplicative gate over existing user NS tokens. It
+# does not append a token, so it can be added to a strong time base without
+# changing T or consuming a user/item NS slot.
 #
 # Pattern: NS-token-position adds win, per-token-additive adds lose
 # (the d_model channel is already saturated by content + baseline time_bucket).
