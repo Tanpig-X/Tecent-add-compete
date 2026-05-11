@@ -171,7 +171,7 @@ class TimeNSModule(nn.Module):
 
 
 class TimeGateUserNSModule(nn.Module):
-    """Use the time-summary token to modulate existing user NS tokens.
+    """Use a sample-level time token to modulate existing user NS tokens.
 
     This deliberately does not add an NS token, so RankMixer's T stays
     unchanged. The final projection is zero-initialized, making the module an
@@ -203,17 +203,17 @@ class TimeGateUserNSModule(nn.Module):
     def forward(
         self,
         user_ns: torch.Tensor,
-        time_token: torch.Tensor,
+        sample_time_token: torch.Tensor,
     ) -> torch.Tensor:
         """Apply a feature-wise multiplicative gate to user NS tokens.
 
         Args:
             user_ns: (B, U, D) user-side NS tokens.
-            time_token: (B, 1, D) or (B, D) time-summary token.
+            sample_time_token: (B, 1, D) or (B, D) sample hour-weekday token.
         """
-        if time_token.dim() == 3:
-            time_token = time_token.squeeze(1)
-        delta = torch.tanh(self.net(time_token)) * self.gate_scale
+        if sample_time_token.dim() == 3:
+            sample_time_token = sample_time_token.squeeze(1)
+        delta = torch.tanh(self.net(sample_time_token)) * self.gate_scale
         return user_ns * (1.0 + delta.unsqueeze(1))
 
 
@@ -1815,8 +1815,9 @@ class PCVRHyFormer(nn.Module):
         # token. Lets backbone attention attend to time DISTRIBUTION
         # explicitly (orthogonal to the per-token additive time signal).
         use_time_ns_token: bool = False,
-        # Reuse the time-summary token as a zero-initialized gate over the
-        # existing user NS tokens. This adds no NS token and does not change T.
+        # Reuse the sample-level hour-weekday token as a zero-initialized gate
+        # over existing user NS tokens. This adds no NS token and does not
+        # change T.
         time_gate_user_ns: bool = False,
         time_gate_user_ns_scale: float = 0.5,
         # NS-form A: sample-level hour/weekday → 1 dedicated NS token via
@@ -1970,24 +1971,24 @@ class PCVRHyFormer(nn.Module):
 
         # ================== Time NS token (aggregated histograms) ==================
         self.use_time_ns_token = bool(use_time_ns_token)
-        self.time_gate_user_ns = bool(time_gate_user_ns and num_time_buckets > 0)
-        if (self.use_time_ns_token or self.time_gate_user_ns) and num_time_buckets > 0:
+        if self.use_time_ns_token and num_time_buckets > 0:
             self.time_ns_module = TimeNSModule(
                 num_time_buckets=num_time_buckets,
                 num_seq_domains=self.num_sequences,
                 d_model=d_model,
             )
+
+        # ================== Sample-level time NS token (NS-form A) ==================
+        self.use_sample_time_ns_token = bool(use_sample_time_ns_token)
+        self.time_gate_user_ns = bool(time_gate_user_ns)
+        if self.use_sample_time_ns_token or self.time_gate_user_ns:
+            self.sample_time_ns_module = SampleTimeNSModule(
+                emb_dim=emb_dim, d_model=d_model)
         if self.time_gate_user_ns:
             self.time_gate_user_ns_module = TimeGateUserNSModule(
                 d_model=d_model,
                 gate_scale=time_gate_user_ns_scale,
             )
-
-        # ================== Sample-level time NS token (NS-form A) ==================
-        self.use_sample_time_ns_token = bool(use_sample_time_ns_token)
-        if self.use_sample_time_ns_token:
-            self.sample_time_ns_module = SampleTimeNSModule(
-                emb_dim=emb_dim, d_model=d_model)
 
         # ================== DIN target attention ==================
         # When enabled, looks up the index of `din_history_fid` inside the
@@ -2429,6 +2430,17 @@ class PCVRHyFormer(nn.Module):
         target = torch.cat(item_parts, dim=1).mean(dim=1)
         return self.target_query_proj(target)
 
+    def _compute_sample_time_token(self, inputs: ModelInput) -> torch.Tensor:
+        """Build the sample-level hour-weekday token used by NS-form A."""
+        B = inputs.user_int_feats.shape[0]
+        hour = (inputs.sample_hour_bucket
+                if inputs.sample_hour_bucket is not None
+                else torch.zeros(B, dtype=torch.long, device=inputs.user_int_feats.device))
+        wkday = (inputs.sample_weekday_bucket
+                 if inputs.sample_weekday_bucket is not None
+                 else torch.zeros(B, dtype=torch.long, device=inputs.user_int_feats.device))
+        return self.sample_time_ns_module(hour, wkday)
+
     def forward(self, inputs: ModelInput) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Runs the forward pass.
 
@@ -2446,13 +2458,11 @@ class PCVRHyFormer(nn.Module):
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats, user_dense_for_pair)   # (B, num_user_groups, D)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats, item_dense_for_pair)   # (B, num_item_groups, D)
 
-        time_ns_tok = None
-        if self.use_time_ns_token or self.time_gate_user_ns:
-            time_buckets_list = [
-                inputs.seq_time_buckets[d] for d in self.seq_domains]
-            time_ns_tok = self.time_ns_module(time_buckets_list)  # (B, 1, D)
-        if self.time_gate_user_ns and time_ns_tok is not None:
-            user_ns = self.time_gate_user_ns_module(user_ns, time_ns_tok)
+        sample_time_tok = None
+        if self.use_sample_time_ns_token or self.time_gate_user_ns:
+            sample_time_tok = self._compute_sample_time_token(inputs)  # (B, 1, D)
+        if self.time_gate_user_ns and sample_time_tok is not None:
+            user_ns = self.time_gate_user_ns_module(user_ns, sample_time_tok)
 
         ns_parts = [user_ns]
         if self.has_user_dense:
@@ -2465,17 +2475,13 @@ class PCVRHyFormer(nn.Module):
             ns_parts.append(item_dense_tok)
         if self.din_enabled:
             ns_parts.append(self._compute_din_token(inputs))         # (B, 1, D)
-        if self.use_time_ns_token and time_ns_tok is not None:
+        if self.use_time_ns_token:
+            time_buckets_list = [
+                inputs.seq_time_buckets[d] for d in self.seq_domains]
+            time_ns_tok = self.time_ns_module(time_buckets_list)  # (B, 1, D)
             ns_parts.append(time_ns_tok)  # (B, 1, D)
-        if self.use_sample_time_ns_token:
-            B = inputs.user_int_feats.shape[0]
-            hour = (inputs.sample_hour_bucket
-                    if inputs.sample_hour_bucket is not None
-                    else torch.zeros(B, dtype=torch.long, device=inputs.user_int_feats.device))
-            wkday = (inputs.sample_weekday_bucket
-                     if inputs.sample_weekday_bucket is not None
-                     else torch.zeros(B, dtype=torch.long, device=inputs.user_int_feats.device))
-            ns_parts.append(self.sample_time_ns_module(hour, wkday))   # (B, 1, D)
+        if self.use_sample_time_ns_token and sample_time_tok is not None:
+            ns_parts.append(sample_time_tok)   # (B, 1, D)
 
         ns_tokens = torch.cat(ns_parts, dim=1)  # (B, num_ns, D)
 
@@ -2542,13 +2548,11 @@ class PCVRHyFormer(nn.Module):
         user_ns = self.user_ns_tokenizer(inputs.user_int_feats, user_dense_for_pair)
         item_ns = self.item_ns_tokenizer(inputs.item_int_feats, item_dense_for_pair)
 
-        time_ns_tok = None
-        if self.use_time_ns_token or self.time_gate_user_ns:
-            time_buckets_list = [
-                inputs.seq_time_buckets[d] for d in self.seq_domains]
-            time_ns_tok = self.time_ns_module(time_buckets_list)
-        if self.time_gate_user_ns and time_ns_tok is not None:
-            user_ns = self.time_gate_user_ns_module(user_ns, time_ns_tok)
+        sample_time_tok = None
+        if self.use_sample_time_ns_token or self.time_gate_user_ns:
+            sample_time_tok = self._compute_sample_time_token(inputs)
+        if self.time_gate_user_ns and sample_time_tok is not None:
+            user_ns = self.time_gate_user_ns_module(user_ns, sample_time_tok)
 
         ns_parts = [user_ns]
         if self.has_user_dense:
@@ -2561,17 +2565,13 @@ class PCVRHyFormer(nn.Module):
             ns_parts.append(item_dense_tok)
         if self.din_enabled:
             ns_parts.append(self._compute_din_token(inputs))
-        if self.use_time_ns_token and time_ns_tok is not None:
+        if self.use_time_ns_token:
+            time_buckets_list = [
+                inputs.seq_time_buckets[d] for d in self.seq_domains]
+            time_ns_tok = self.time_ns_module(time_buckets_list)
             ns_parts.append(time_ns_tok)
-        if self.use_sample_time_ns_token:
-            B = inputs.user_int_feats.shape[0]
-            hour = (inputs.sample_hour_bucket
-                    if inputs.sample_hour_bucket is not None
-                    else torch.zeros(B, dtype=torch.long, device=inputs.user_int_feats.device))
-            wkday = (inputs.sample_weekday_bucket
-                     if inputs.sample_weekday_bucket is not None
-                     else torch.zeros(B, dtype=torch.long, device=inputs.user_int_feats.device))
-            ns_parts.append(self.sample_time_ns_module(hour, wkday))
+        if self.use_sample_time_ns_token and sample_time_tok is not None:
+            ns_parts.append(sample_time_tok)
 
         ns_tokens = torch.cat(ns_parts, dim=1)
 

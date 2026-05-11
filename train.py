@@ -231,11 +231,12 @@ def parse_args() -> argparse.Namespace:
                              '--user_ns_tokens by 1 to compensate).')
     parser.add_argument('--time_gate_user_ns', action='store_true',
                         default=False,
-                        help='Use the same TimeNSModule time-summary vector '
-                             'to multiplicatively gate existing user NS '
-                             'tokens. This adds no NS token and does not '
-                             'change T. The gate is zero-initialized, so the '
-                             'model starts exactly equivalent to the base.')
+                        help='Use the SampleTimeNSModule sample-level '
+                             'hour-weekday vector to multiplicatively gate '
+                             'existing user NS tokens. This adds no NS token '
+                             'and does not change T. The gate is '
+                             'zero-initialized, so the model starts exactly '
+                             'equivalent to the base.')
     parser.add_argument('--time_gate_user_ns_scale', type=float, default=0.5,
                         help='Maximum multiplicative delta for '
                              '--time_gate_user_ns. The learned gate is '

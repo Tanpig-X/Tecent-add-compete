@@ -121,10 +121,10 @@ python3 -u "${SCRIPT_DIR}/train.py" \
 # the seq side and avoiding extra NS tokens / T changes. Use comma-separated
 # domains for combinations, e.g. seq_c,seq_d.
 #
-# --time_gate_user_ns: reuse TimeNSModule's per-domain time histogram summary
-# as a zero-initialized multiplicative gate over existing user NS tokens. It
-# does not append a token, so it can be added to a strong time base without
-# changing T or consuming a user/item NS slot.
+# --time_gate_user_ns: reuse SampleTimeNSModule's sample-level hour-weekday
+# token as a zero-initialized multiplicative gate over existing user NS tokens.
+# It does not append another token, so it can be added to a strong sample-time
+# base without changing T or consuming a user/item NS slot.
 #
 # Pattern: NS-token-position adds win, per-token-additive adds lose
 # (the d_model channel is already saturated by content + baseline time_bucket).
